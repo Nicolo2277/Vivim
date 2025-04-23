@@ -296,7 +296,7 @@ def main():
 
     args = cfg.parse_args()
 
-    resume_checkpoint_path = args.resume_path
+    resume_checkpoint_path = 'logs/vivim_OTU/version_15/checkpoints/ultra-epoch15-Dice-0.0000-Jaccard-0.0000.ckpt'#args.resume_path
     '''
     rseed = args.seed
     torch.manual_seed(rseed)
@@ -330,7 +330,7 @@ def main():
         strategy="auto",
         enable_progress_bar=True,
         log_every_n_steps=5,
-        #callbacks = [checkpoint_callback,lr_monitor_callback]
+        callbacks = [checkpoint_callback,lr_monitor_callback]
     ) 
 
 
