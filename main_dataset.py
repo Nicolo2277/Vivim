@@ -185,7 +185,7 @@ class MainDataset(Dataset):
 
         self.samples = []
 
-        for vid_name in sorted(os.listdir(root), key=int):
+        for vid_name in sorted(os.listdir(root)):
             vid_dir = os.path.join(root, vid_name)
             if not os.path.isdir(vid_dir):
                 continue
@@ -194,11 +194,11 @@ class MainDataset(Dataset):
             frames = sorted([
                 f for f in os.listdir(vid_dir)
                 if f.endswith('.png') and f.lower() == 'frame.png' or 'frame' in f.lower()
-            ], key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
+            ], key=lambda x: int(os.path.splitext(x)[0].split('_')[0]))
             gts = sorted([
                 f for f in os.listdir(vid_dir)
-                if f.endswith('.png') and f.lower() == 'background.png' in f.lower()
-            ], key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
+                if f.endswith('.png') and f.lower() == 'background.png' or 'background' in f.lower()
+            ], key=lambda x: int(os.path.splitext(x)[0].split('_')[0]))
 
             N = len(frames)
             if N < clip_len:
@@ -211,6 +211,7 @@ class MainDataset(Dataset):
                     os.path.join(vid_dir, frames[j])
                     for j in range(i - half, i + half + 1)
                 ]
+                
                 gt_paths = [
                     os.path.join(vid_dir, gts[j])
                     for j in range(i - half, i + half + 1)
@@ -228,25 +229,29 @@ class MainDataset(Dataset):
         #Here apply fan 
         frames = [Image.open(p).convert('RGB') for p in clip_paths]
         frames = [self.img_transform(im) for im in frames]
-        clip_tensor = torch.stack(frames, dim=0)  # (clip_len, C, H, W)
+        clip_tensor = torch.stack(frames)  # (clip_len, C, H, W)
 
         gts = [Image.open(gt).convert('L') for gt in gt_paths]
-        gts = [invert_mask(gt) for gt in gts]
-        
+
         edge =  []
 
         for i in range(len(gts)):
             gts[i] = np.array(gts[i])
             gts[i] = Image.fromarray(gts[i])
             gts[i] = self.gt_transform(randomPeper(gts[i]))
+            gts[i] = invert_mask(gts[i])
             _edgemap = gts[i].clone()
             _edgemap = convert_mask(_edgemap, 1)
             _edgemap = _edgemap.numpy()
             _edgemap = self.onehot_to_binary_edges(_edgemap, 2, num_classes=2)
             _edgemap = torch.from_numpy(_edgemap).float()
-            edge.appens(_edgemap)
+            #_edgemap = torch.from_numpy(_edgemap).unsqueeze(0).float()
+            edge.append(_edgemap)
 
-        gts_tensor = torch.stack(gts, dim=0)         # (clip_len, H, W)
+        gts_tensor = torch.stack(gts)         # (clip_len, H, W)
+        #gts_tensor = gts_tensor.squeeze(1)
+        #print(gts_tensor.shape)
+        #print(clip_tensor.shape)
 
         return clip_tensor, gts_tensor, torch.stack(edge)
     

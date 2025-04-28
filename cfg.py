@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument('-initlr', type=float, default=1e-4, help='initial learning rate')
     parser.add_argument('-weights', type=str, default = 0, help='the weights file you want to test')
     parser.add_argument('-data_path', type=str, default=None, help='The path of segmentation data')
-    parser.add_argument('-clip_length', type=int, default=1, help='clip length')
+    parser.add_argument('-clip_length', type=int, default=3, help='clip length')
     parser.add_argument('-epochs', type=int, default=10, help='number of epochs')
     parser.add_argument('-resume_path', type=str, default=None, help='resume checkpoint path')
     parser.add_argument('-test_bs', type=int, default=1, help='test batch size')

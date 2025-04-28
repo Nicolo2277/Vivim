@@ -166,4 +166,7 @@ logs/
 runs/
 Preliminary-data/
 TrainData/
+canc.py
+wandb/
+Vivim_binary_segmentation/
 *.pt

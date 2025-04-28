@@ -20,31 +20,58 @@ from pytorch_lightning.accelerators import accelerator
 from pytorch_lightning.core.hooks import CheckpointHooks
 from pytorch_lightning.callbacks import ModelCheckpoint,DeviceStatsMonitor,EarlyStopping,LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from argparse import Namespace
 
 from OTU_dataset import *
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from loss import *
 # from models2.refinenet import RefineNet
 from torchvision.utils import save_image
+import wandb
+import misc2
+
+args = cfg.parse_args()
 
 output_dir = 'logs'
 version_name='Baseline'
-logger = TensorBoardLogger(name='vivim_OTU',save_dir = output_dir )
+wandb.init(
+    project='Vivim_binary_segmentation',
+    name='Baseline',
+    config=vars(args)
+)
+
+logger = WandbLogger(save_dir='.',
+                     name='Baseline',
+                     project='Vivim_binary_segmentation',
+                     log_model=True)
+
+
 import matplotlib.pyplot as plt
 # import tent
 import math
 
 from medpy import metric
 # from misc import *
-import misc2
 import torchmetrics
 from modeling.vivim import Vivim
 
 from poloy_metrics import *
 from modeling.utils import JointEdgeSegLoss
 # torch.set_float32_matmul_precision('high')
+from main_dataset import *
+
+
+# === New wrapper to expose sample indices ===
+class IndexedDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx):
+        # return index along with original sample tuple
+        data = self.dataset[idx]
+        return idx, *data
 
 def structure_loss(pred, mask):
     weit  = 1+5*torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15)-mask)
@@ -59,11 +86,16 @@ def structure_loss(pred, mask):
     return (wbce+wiou).mean()
 
 def get_loader(args, mode):
-        full_dataset = OTU_2D(args, args.data_path)
+        full_dataset = MainDataset(root=args.data_path, trainsize=args.image_size, clip_len=args.clip_length)
+        indexed = IndexedDataset(full_dataset)
         train_size = int(len(full_dataset) * 0.8)
         val_size = len(full_dataset) - train_size
 
-        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+        train_indices = list(range(0, train_size))
+        val_indices   = list(range(train_size, len(full_dataset)))
+
+        train_dataset = Subset(indexed, train_indices)
+        val_dataset = Subset(indexed, val_indices)
 
         if mode == 'training': 
             train_loader = DataLoader(train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=2, pin_memory=True)
@@ -107,6 +139,8 @@ class CoolSystem(pl.LightningModule):
         self.model = Vivim(with_edge=self.with_edge)
 
         self.save_hyperparameters()
+
+        self.val_losses = []
     
     def configure_optimizers(self):
         #We filter the parameters that require gradients, avoid updating frozen parts
@@ -144,9 +178,12 @@ class CoolSystem(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.model.train()
         
-        neigbor, target, edge_gt = batch
+        indices, neigbor, target, edge_gt = batch
         target = target.cuda()
         neigbor = neigbor.cuda()
+
+        # Log sample IDs for leakage check
+        self.log('train/sample_ids', indices.float().mean(), on_step=True, prog_bar=False)
 
         #print(neigbor.shape) torch.Size([12, 1, 3, 256, 256])
         #print(target.shape) torch.Size([12, 1, 1, 256, 256])
@@ -187,6 +224,8 @@ class CoolSystem(pl.LightningModule):
         for pred, gt in zip(self.preds,self.gts):
             pred = torch.sigmoid(pred)
             # gt = gt.to(int)
+            #print(pred.shape) #shape = [1, 1, 256, 256]
+            #print(gt.shape) #shape = [3, 1, 256, 256]
             self.sm.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
             self.em.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
             self.mae.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
@@ -226,8 +265,8 @@ class CoolSystem(pl.LightningModule):
         em = self.em.get_results()['meanEm']
         mae = self.mae.get_results()['MAE']
 
-        print(len(self.gts))
-        print(len(self.preds))
+        #print(len(self.gts))
+        #print(len(self.preds))
         
         self.log('Dice',dice)
         self.log('Jaccard',jac)
@@ -241,13 +280,24 @@ class CoolSystem(pl.LightningModule):
 
         self.gts = []
         self.preds = []
+
+        if self.trainer.current_epoch == 0:
+            # skip first epoch
+            pass
+        else:
+            print(f"Epoch {self.current_epoch}: Avg val loss = {torch.stack(self.val_losses).mean():.4f}")
+        self.val_losses.clear()
+
         print("Val: Dice {0}, Jaccard {1}, Precision {2}, Recall {3}, Fmeasure {4}, specificity: {5}, Smeasure {6}, Emeasure {7}, MAE: {8}".format(dice,jac,precision,recall,f_measure,acc,sm,em,mae))
 
     def validation_step(self, batch, batch_idx):
         # torch.set_grad_enabled(True)
         self.model.eval()
         
-        neigbor, target, _= batch
+        indices, neigbor, target, _= batch
+        
+        # Log sample IDs in validation
+        self.log('val/sample_ids', indices.float().mean(), on_step=True)
 
         if len(neigbor.shape) == 5:
             bz, nf, nc, h, w = neigbor.shape
@@ -257,6 +307,11 @@ class CoolSystem(pl.LightningModule):
             neigbor = neigbor.unsqueeze(1)
         else:
             raise ValueError('Unexpected tensor shape for neigbor')
+
+        # Compute predictions and loss
+        loss = self._compute_loss(neigbor, target, _)
+        self.log('val_loss', loss, prog_bar=True)
+        self.val_losses.append(loss)
 
         # import time
         # start = time.time()
@@ -268,9 +323,16 @@ class CoolSystem(pl.LightningModule):
         #print('2', self.nFrames)
         samples = samples[self.nFrames//2::self.nFrames]
         #print('3', samples.shape) torch.Size([1, 1, 256, 256])
+        #print(len(target.shape)) 5
+        if len(target.shape) == 4:
+            bz, nf, h, w = target.shape
+            nc = 1
 
-        bz, nf, nc, h, w = target.shape
-        target = target.reshape(bz*nf, nc, h, w)
+        else:
+            bz, nf, nc, h, w = target.shape
+
+            target = target.reshape(bz*nf, nc, h, w)
+            target = target[self.nFrames//2 :: self.nFrames]      # now (1,1,256,256)
 
         os.makedirs(self.save_path, exist_ok=True)
         
@@ -280,9 +342,19 @@ class CoolSystem(pl.LightningModule):
         filename = "target_{}.png".format(batch_idx)
         save_image(target,os.path.join(self.save_path, filename))
 
+        imgs = [samples.cpu(), target.cpu()]
+        captions = ["prediction", "ground_truth"]
+
+        # Log both images under one key
+        self.logger.log_image(
+            key="val_examples", 
+            images=imgs, 
+            caption=captions
+        )
+
         self.preds.append(samples)
         self.gts.append(target)
-    
+
     def train_dataloader(self):
         train_loader = get_loader(self.params, mode='training')
         return train_loader
@@ -291,12 +363,24 @@ class CoolSystem(pl.LightningModule):
         val_loader = get_loader(self.params, mode='validation')
         return val_loader 
 
+    def _compute_loss(self, neigbor, target, rest):
+        # factor out training/validation loss computation
+        # existing model forward + criterion
+        if not self.with_edge:
+            pred = self.model(neigbor.cuda())
+            target = target.cuda().reshape(pred.shape)
+            return self.criterion(pred[self.nFrames//2::self.nFrames], target[self.nFrames//2::self.nFrames])
+        else:
+            pred, e0 = self.model(neigbor.cuda())
+            target = target.cuda().reshape(pred.shape)
+            edge_gt = rest[0].cuda().reshape(e0.shape)
+            return self.criterion((pred[self.nFrames//2::self.nFrames], e0[self.nFrames//2::self.nFrames]),
+                                   (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
 
 def main():
 
-    args = cfg.parse_args()
-
-    resume_checkpoint_path = 'logs/vivim_OTU/version_15/checkpoints/ultra-epoch15-Dice-0.0000-Jaccard-0.0000.ckpt'#args.resume_path
+    #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
+    resume_checkpoint_path = args.resume_path
     '''
     rseed = args.seed
     torch.manual_seed(rseed)
@@ -330,7 +414,7 @@ def main():
         strategy="auto",
         enable_progress_bar=True,
         log_every_n_steps=5,
-        callbacks = [checkpoint_callback,lr_monitor_callback]
+        #callbacks = [checkpoint_callback,lr_monitor_callback]
     ) 
 
 
