@@ -206,7 +206,7 @@ class MainDataset(Dataset):
                 continue  # skip too-short videos
 
             # for each valid center index, collect its window
-            for i in range(half, N - half):
+            for i in range(half, N - half, clip_len):
                 clip_paths = [
                     os.path.join(vid_dir, frames[j])
                     for j in range(i - half, i + half + 1)

@@ -34,10 +34,10 @@ import misc2
 args = cfg.parse_args()
 
 output_dir = 'logs'
-version_name='scarta'
+version_name='overfit'
 wandb.init(
     project='Vivim_binary_segmentation',
-    name='scarta',
+    name='overfit',
     config=vars(args)
 )
 
@@ -88,21 +88,11 @@ def structure_loss(pred, mask):
 def get_loader(args, mode):
         full_dataset = MainDataset(root=args.data_path, trainsize=args.image_size, clip_len=args.clip_length)
         indexed = IndexedDataset(full_dataset)
-        train_size = int(len(full_dataset) * 0.8)
-        val_size = len(full_dataset) - train_size
+        tiny_indices = list(range(5))
 
-        train_indices = list(range(0, train_size))
-        val_indices   = list(range(train_size, len(full_dataset)))
-
-        train_dataset = Subset(indexed, train_indices)
-        val_dataset = Subset(indexed, val_indices)
-
-        if mode == 'training': 
-            train_loader = DataLoader(train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=2, pin_memory=True)
-            return train_loader
-        elif mode=='validation':
-            val_loader = DataLoader(val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=2, pin_memory=True)
-            return val_loader
+        tiny_dataset = Subset(indexed, tiny_indices)
+        train_loader = DataLoader(tiny_dataset,  batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+        return train_loader
 
 
 class CoolSystem(pl.LightningModule):
@@ -144,7 +134,7 @@ class CoolSystem(pl.LightningModule):
     
     def configure_optimizers(self):
         #We filter the parameters that require gradients, avoid updating frozen parts
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.999])#,weight_decay=self.weight_decay)
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,weight_decay=0.0)#,weight_decay=self.weight_decay)
          
         # optimizer = Lion(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.99],weight_decay=0)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.initlr * 0.01)
@@ -223,7 +213,6 @@ class CoolSystem(pl.LightningModule):
         # print(Thresholds)
 
         for pred, gt in zip(self.preds,self.gts):
-            #pred = torch.sigmoid(pred)
             # gt = gt.to(int)
             #print(pred.shape) #shape = [1, 1, 256, 256]
             #print(gt.shape) #shape = [3, 1, 256, 256]
@@ -310,15 +299,20 @@ class CoolSystem(pl.LightningModule):
         #print('Samples shape: ',samples.shape) #torch.Size([3, 1, 256, 256])
 
         samples = samples[self.nFrames//2::self.nFrames]
-        #ONLY FOR CLIP_LEN=3 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        samples = torch.sigmoid(samples)
-        samples = (samples > 0.5).float()
+
 
         #print('Samples shape: ',samples.shape) #torch.Size([1, 1, 256, 256])
 
         target = target.squeeze(0)
         target = target[self.nFrames//2::self.nFrames]
         #print('Target shape: ', target.shape) #torch.Size([1, 1, 256, 256])
+
+        loss = self.criterion(samples, target)
+        self.log('val_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.val_losses.append(loss.detach())
+
+        samples = torch.sigmoid(samples)
+        samples = (samples > 0.5).float()
 
         filename = "sample_{}.png".format(batch_idx)
         save_image(samples,os.path.join(self.save_path, filename))      
@@ -337,7 +331,9 @@ class CoolSystem(pl.LightningModule):
 
         self.preds.append(samples)
         self.gts.append(target)
-        
+
+        return loss
+       
 
     def train_dataloader(self):
         train_loader = get_loader(self.params, mode='training')
@@ -378,6 +374,10 @@ def main():
     '''
     model = CoolSystem(args)
 
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+
     checkpoint_callback = ModelCheckpoint(
     monitor='Dice',
     #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
@@ -391,17 +391,14 @@ def main():
 
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
     trainer = pl.Trainer(
-        check_val_every_n_epoch=args.val_freq,
-        max_epochs=args.epochs,
-        accelerator='gpu',
-        devices=1,
-        precision=16,
-        logger=logger,
-        strategy="auto",
-        enable_progress_bar=True,
-        log_every_n_steps=5,
-        #callbacks = [checkpoint_callback,lr_monitor_callback]
-    ) 
+    max_epochs=100,
+    overfit_batches=5,      # overfit on exactly 5 batches of train & val
+    accelerator='gpu',
+    devices=1,
+    precision=16,
+    logger=logger,
+    enable_progress_bar=True,
+)
 
 
     trainer.fit(model,ckpt_path=resume_checkpoint_path)
@@ -409,4 +406,4 @@ def main():
     # trainer.validate(model,ckpt_path=val_path)
     
 if __name__ == '__main__':
-    main()
+    main()  

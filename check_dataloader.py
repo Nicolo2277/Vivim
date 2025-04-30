@@ -69,8 +69,16 @@ def main():
     print(f"   edge_batch shape: {edge_batch.shape}  # (B, L, 1, H, W)")
 
     # 4) visualize the first sample in the batch
-    visualize_clip(clip_batch, gt_batch, edge_batch, idx=0)
+    #visualize_clip(clip_batch, gt_batch, edge_batch, idx=0)
 
+
+    clip, masks, edges = dataset[10]
+    print(dataset.samples[10])  # -> ([frame1.png, frame2.png, …], [mask1.png, mask2.png, …])
+
+    plt.subplot(1,3,1); plt.imshow(clip[1].permute(1,2,0))
+    plt.subplot(1,3,2); plt.imshow(masks[1].squeeze(), cmap='gray')
+    plt.subplot(1,3,3); plt.imshow(edges[1], cmap='gray')
+    plt.show()
 
 if __name__ == "__main__":
     main()
