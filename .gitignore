@@ -170,5 +170,6 @@ canc.py
 wandb/
 Vivim_binary_segmentation/
 clinical-cases-metadata-holsbeke.csv
+Folds/
 Train_items.csv
 *.pt
