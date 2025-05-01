@@ -35,10 +35,10 @@ from create_train_set import *
 args = cfg.parse_args()
 
 output_dir = 'logs'
-version_name='scarta'
+version_name='binary segmentation'
 wandb.init(
     project='Vivim_binary_segmentation',
-    name='scarta',
+    name='binary segmentation',
     config=vars(args)
 )
 
@@ -362,6 +362,8 @@ def main():
     pl.seed_everything(args.seed, workers=True)
     
     for fold in range(args.num_folds):
+        
+        print('Start training for fold number ', fold)
 
         #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
         resume_checkpoint_path = args.resume_path
