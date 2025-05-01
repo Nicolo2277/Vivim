@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument('-image_size', type=int, default=256, help='image_size')
     parser.add_argument('-out_size', type=int, default=256, help='output_size')
     parser.add_argument('-distributed', default='none', type=str, help='multi GPU ids to use')
-    parser.add_argument('-dataset', default='OTU_2d' ,type=str, help='dataset name')
+    parser.add_argument('-dataset', default='RawDataset' ,type=str, help='dataset name')
     parser.add_argument('-train_bs', type=int, default=1, help='batch size for trainloader')
     parser.add_argument('-initlr', type=float, default=1e-4, help='initial learning rate')
     parser.add_argument('-weights', type=str, default = 0, help='the weights file you want to test')
@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument('-with_edge', type=bool, default=False)
     parser.add_argument('-num_classes', type=int, default=2)
     parser.add_argument('-num_folds', type=int, default=5, help='number of folds used')
+    parser.add_argument('-seed', type=int, default=42)
 
     opt = parser.parse_args()
 

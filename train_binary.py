@@ -91,10 +91,10 @@ def get_loader(args, mode, num_fold):
         full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length)
 
         if mode == 'training': 
-            train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=2, pin_memory=True)
+            train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
             return train_loader
         elif mode=='validation':
-            val_loader = DataLoader(full_val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=2, pin_memory=True)
+            val_loader = DataLoader(full_val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
             return val_loader
 
 
@@ -358,18 +358,14 @@ class CoolSystem(pl.LightningModule):
                                    (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
 
 def main():
+   
+    pl.seed_everything(args.seed, workers=True)
+    
     for fold in range(args.num_folds):
+
         #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
         resume_checkpoint_path = args.resume_path
-        '''
-        rseed = args.seed
-        torch.manual_seed(rseed)
-        random.seed(rseed)
-        np.random.seed(rseed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(rseed)
-        torch.backends.cudnn.benchmark = True
-        '''
+      
         model = CoolSystem(args, fold_number=fold)
 
         checkpoint_callback = ModelCheckpoint(
@@ -394,7 +390,7 @@ def main():
             strategy="auto",
             enable_progress_bar=True,
             log_every_n_steps=5,
-            #callbacks = [checkpoint_callback,lr_monitor_callback]
+            callbacks = [checkpoint_callback,lr_monitor_callback]
         ) 
 
 
