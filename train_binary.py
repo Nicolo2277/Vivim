@@ -30,6 +30,7 @@ from loss import *
 from torchvision.utils import save_image
 import wandb
 import misc2
+from create_train_set import *
 
 args = cfg.parse_args()
 
@@ -62,17 +63,6 @@ from modeling.utils import JointEdgeSegLoss
 from main_dataset import *
 
 
-# === New wrapper to expose sample indices ===
-class IndexedDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-    def __len__(self):
-        return len(self.dataset)
-    def __getitem__(self, idx):
-        # return index along with original sample tuple
-        data = self.dataset[idx]
-        return idx, *data
-
 def structure_loss(pred, mask):
     weit  = 1+5*torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15)-mask)
     wbce  = F.binary_cross_entropy_with_logits(pred, mask, reduce='none')
@@ -85,29 +75,32 @@ def structure_loss(pred, mask):
     wiou  = 1-(inter+1)/(union-inter+1)
     return (wbce+wiou).mean()
 
-def get_loader(args, mode):
-        full_dataset = MainDataset(root=args.data_path, trainsize=args.image_size, clip_len=args.clip_length)
-        indexed = IndexedDataset(full_dataset)
-        train_size = int(len(full_dataset) * 0.8)
-        val_size = len(full_dataset) - train_size
+def get_loader(args, mode, num_fold):
+        input_root = 'Folds/fold_' + str(num_fold)
 
-        train_indices = list(range(0, train_size))
-        val_indices   = list(range(train_size, len(full_dataset)))
+        train_path = os.path.join(input_root, 'train')
+        train_output_root = 'TrainData_fold_' + str(num_fold)
+        train_output_root = os.path.join(train_output_root, 'train')
+        gather_annotated_frames(Path(train_path), Path(train_output_root))
+        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length)
 
-        train_dataset = Subset(indexed, train_indices)
-        val_dataset = Subset(indexed, val_indices)
+        val_path = os.path.join(input_root, 'val')
+        val_output_root = 'TrainData_fold_' + str(num_fold)
+        val_output_root = os.path.join(val_output_root, 'val')
+        gather_annotated_frames(Path(val_path), Path(val_output_root))
+        full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length)
 
         if mode == 'training': 
-            train_loader = DataLoader(train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=2, pin_memory=True)
+            train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=2, pin_memory=True)
             return train_loader
         elif mode=='validation':
-            val_loader = DataLoader(val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=2, pin_memory=True)
+            val_loader = DataLoader(full_val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=2, pin_memory=True)
             return val_loader
 
 
 class CoolSystem(pl.LightningModule):
     
-    def __init__(self, hparams):
+    def __init__(self, hparams, fold_number):
         super(CoolSystem, self).__init__()
 
         self.params = hparams
@@ -116,7 +109,9 @@ class CoolSystem(pl.LightningModule):
 
         self.train_batchsize = self.params.train_bs
         self.val_batchsize = self.params.val_bs
-    
+
+        self.fold_number = fold_number 
+        
         #Train setting
         self.initlr = self.params.initlr #initial learning rate
         self.weight_decay = self.params.weight_decay #optimizers weight decay
@@ -178,12 +173,9 @@ class CoolSystem(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.model.train()
         
-        indices, neigbor, target, edge_gt = batch
+        neigbor, target, edge_gt = batch
         target = target.cuda()
         neigbor = neigbor.cuda()
-
-        # Log sample IDs for leakage check
-        self.log('train/sample_ids', indices.float().mean(), on_step=True, prog_bar=False)
 
         #print(neigbor.shape) #torch.Size([2, 3, 3, 256, 256])
         #print(target.shape) #torch.Size([2, 3, 1, 256, 256])
@@ -295,10 +287,7 @@ class CoolSystem(pl.LightningModule):
         # torch.set_grad_enabled(True)
         self.model.eval()
         
-        indices, neigbor, target, _= batch
-        
-        # Log sample IDs in validation
-        #self.log('val/sample_ids', indices.float().mean(), on_step=True)
+        neigbor, target, _= batch
 
         bz, nf, nc, h, w = neigbor.shape
 
@@ -310,15 +299,19 @@ class CoolSystem(pl.LightningModule):
         #print('Samples shape: ',samples.shape) #torch.Size([3, 1, 256, 256])
 
         samples = samples[self.nFrames//2::self.nFrames]
-        #ONLY FOR CLIP_LEN=3 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        samples = torch.sigmoid(samples)
-        samples = (samples > 0.5).float()
 
         #print('Samples shape: ',samples.shape) #torch.Size([1, 1, 256, 256])
 
         target = target.squeeze(0)
         target = target[self.nFrames//2::self.nFrames]
         #print('Target shape: ', target.shape) #torch.Size([1, 1, 256, 256])
+        loss = self.criterion(samples, target)
+        self.log('val_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.val_losses.append(loss.detach())
+
+        #ONLY FOR Binary class !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        samples = torch.sigmoid(samples)
+        samples = (samples > 0.5).float()
 
         filename = "sample_{}.png".format(batch_idx)
         save_image(samples,os.path.join(self.save_path, filename))      
@@ -338,13 +331,14 @@ class CoolSystem(pl.LightningModule):
         self.preds.append(samples)
         self.gts.append(target)
         
+        return loss
 
     def train_dataloader(self):
-        train_loader = get_loader(self.params, mode='training')
+        train_loader = get_loader(self.params, mode='training', num_fold=self.fold_number)
         return train_loader
     
     def val_dataloader(self):
-        val_loader = get_loader(self.params, mode='validation')
+        val_loader = get_loader(self.params, mode='validation', num_fold=self.fold_number)
         return val_loader 
 
     def _compute_loss(self, neigbor, target, rest):
@@ -364,49 +358,49 @@ class CoolSystem(pl.LightningModule):
                                    (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
 
 def main():
+    for fold in range(args.num_folds):
+        #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
+        resume_checkpoint_path = args.resume_path
+        '''
+        rseed = args.seed
+        torch.manual_seed(rseed)
+        random.seed(rseed)
+        np.random.seed(rseed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(rseed)
+        torch.backends.cudnn.benchmark = True
+        '''
+        model = CoolSystem(args, fold_number=fold)
 
-    #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
-    resume_checkpoint_path = args.resume_path
-    '''
-    rseed = args.seed
-    torch.manual_seed(rseed)
-    random.seed(rseed)
-    np.random.seed(rseed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(rseed)
-    torch.backends.cudnn.benchmark = True
-    '''
-    model = CoolSystem(args)
+        checkpoint_callback = ModelCheckpoint(
+        monitor='Dice',
+        #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
+        filename='ultra-epoch{epoch:02d}-Dice-{Dice:.4f}-Jaccard-{Jaccard:.4f}',
+        auto_insert_metric_name=False,   
+        every_n_epochs=1,
+        save_top_k=1,
+        mode = "max",
+        save_last=True
+        )
 
-    checkpoint_callback = ModelCheckpoint(
-    monitor='Dice',
-    #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
-    filename='ultra-epoch{epoch:02d}-Dice-{Dice:.4f}-Jaccard-{Jaccard:.4f}',
-    auto_insert_metric_name=False,   
-    every_n_epochs=1,
-    save_top_k=1,
-    mode = "max",
-    save_last=True
-    )
-
-    lr_monitor_callback = LearningRateMonitor(logging_interval='step')
-    trainer = pl.Trainer(
-        check_val_every_n_epoch=args.val_freq,
-        max_epochs=args.epochs,
-        accelerator='gpu',
-        devices=1,
-        precision=16,
-        logger=logger,
-        strategy="auto",
-        enable_progress_bar=True,
-        log_every_n_steps=5,
-        #callbacks = [checkpoint_callback,lr_monitor_callback]
-    ) 
+        lr_monitor_callback = LearningRateMonitor(logging_interval='step')
+        trainer = pl.Trainer(
+            check_val_every_n_epoch=args.val_freq,
+            max_epochs=args.epochs,
+            accelerator='gpu',
+            devices=1,
+            precision=16,
+            logger=logger,
+            strategy="auto",
+            enable_progress_bar=True,
+            log_every_n_steps=5,
+            #callbacks = [checkpoint_callback,lr_monitor_callback]
+        ) 
 
 
-    trainer.fit(model,ckpt_path=resume_checkpoint_path)
-    # val_path=r'/home/yijun/project/ultra/logs/uentm_polyp/version_60/checkpoints/ultra-epoch.ckpt'
-    # trainer.validate(model,ckpt_path=val_path)
+        trainer.fit(model,ckpt_path=resume_checkpoint_path)
+        # val_path=r'/home/yijun/project/ultra/logs/uentm_polyp/version_60/checkpoints/ultra-epoch.ckpt'
+        # trainer.validate(model,ckpt_path=val_path)
     
 if __name__ == '__main__':
     main()

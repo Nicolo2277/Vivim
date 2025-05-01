@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument('-val_aug', type=bool, default=False)
     parser.add_argument('-with_edge', type=bool, default=False)
     parser.add_argument('-num_classes', type=int, default=2)
+    parser.add_argument('-num_folds', type=int, default=5, help='number of folds used')
 
     opt = parser.parse_args()
 

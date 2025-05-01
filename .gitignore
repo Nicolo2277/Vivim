@@ -171,5 +171,10 @@ wandb/
 Vivim_binary_segmentation/
 clinical-cases-metadata-holsbeke.csv
 Folds/
+TrainData_fold_0/
+TrainData_fold_1/
+TrainData_fold_2/
+TrainData_fold_3/
+TrainData_fold_4/
 Train_items.csv
 *.pt
