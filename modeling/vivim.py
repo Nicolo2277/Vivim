@@ -238,7 +238,7 @@ class Vivim(nn.Module):
     def __init__(
         self,
         in_chans=3,
-        out_chans=1,
+        out_chans=1,  #Change here for multiclass segmentation
         depths=[2, 2, 2, 2],
         feat_size=[64, 128, 320, 512],
         drop_path_rate=0,

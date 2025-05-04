@@ -176,5 +176,11 @@ TrainData_fold_1/
 TrainData_fold_2/
 TrainData_fold_3/
 TrainData_fold_4/
+Multiclass_Folds/
+Multiclass_TrainData_fold_0/
+Multiclass_TrainData_fold_1/
+Multiclass_TrainData_fold_2/
+Multiclass_TrainData_fold_3/
+Multiclass_TrainData_fold_4/
 Train_items.csv
 *.pt
