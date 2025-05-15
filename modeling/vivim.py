@@ -238,10 +238,10 @@ class Vivim(nn.Module):
     def __init__(
         self,
         in_chans=3,
-        out_chans=1,  #Change here for multiclass segmentation
+        out_chans=3,  #Change here for multiclass segmentation
         depths=[2, 2, 2, 2],
         feat_size=[64, 128, 320, 512],
-        drop_path_rate=0,
+        drop_path_rate=0.2,
         layer_scale_init_value=1e-6,
         hidden_size: int = 768,
         norm_name = "instance",
@@ -249,6 +249,7 @@ class Vivim(nn.Module):
         res_block: bool = True,
         spatial_dims=2,
         with_edge=False,
+        dropout_rate=0.3 #added dropout to prevent the model from overfitting
     ) -> None:
         super().__init__()
 
@@ -259,14 +260,17 @@ class Vivim(nn.Module):
         self.drop_path_rate = drop_path_rate
         self.feat_size = feat_size
         self.layer_scale_init_value = layer_scale_init_value
+        self.dropout_rate = dropout_rate
 
         self.spatial_dims = spatial_dims
 
         backbone = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b3-finetuned-ade-512-512")
-        self.encoder = mamba_block(backbone, in_chans, dims=feat_size,
+        self.encoder = mamba_block(backbone, in_chans, dims=feat_size, drop_path_rate=drop_path_rate
                               )
         self.decoder = backbone.decode_head
         # self.decoder.classifier = nn.Sequential()
+
+        self.feature_dropout = nn.Dropout2d(dropout_rate)   #added feature dropout before the final output
 
         self.out = nn.Conv2d(768, out_chans, kernel_size=1)
         # self.conv_proj = ProjectionHead(dim_in=hidden_size)
@@ -305,6 +309,11 @@ class Vivim(nn.Module):
             encoder_hidden_state = nn.functional.interpolate(
                 encoder_hidden_state, size=encoder_hidden_states[0].size()[2:], mode="bilinear", align_corners=False
             )
+
+            #Add dropout to each feature map from the encoder (50% chance of dropping)
+            if torch.rand(1).item() > 0.5:
+                encoder_hidden_state = F.dropout(encoder_hidden_state, p=self.dropout_rate/2, training=self.training)
+
             all_hidden_states += (encoder_hidden_state,)
         concat_hidden_states = torch.cat(all_hidden_states[::-1], dim=1)
         hidden_states = self.decoder.linear_fuse(concat_hidden_states)
@@ -312,6 +321,9 @@ class Vivim(nn.Module):
         hidden_states = self.decoder.activation(hidden_states)
         hidden_states = self.decoder.dropout(hidden_states)
 
+        #Add another dropout before the final layer:
+        hidden_states = self.decoder.dropout(hidden_states)
+        hidden_states = self.feature_dropout(hidden_states)
 
         logits = self.out(hidden_states)
 

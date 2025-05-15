@@ -184,3 +184,10 @@ Multiclass_TrainData_fold_3/
 Multiclass_TrainData_fold_4/
 Train_items.csv
 *.pt
+multiclass_checkpoints/
+multiclass_checkpoints_final/
+Multiclass_TrainData_final/
+results_multiclass/
+TestData_multiclass/
+
+

@@ -3,6 +3,7 @@ import shutil
 from pathlib import Path
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
+import matplotlib.pyplot as plt
 
 def gather_annotated_frames(input_root: Path) -> pd.DataFrame:
 
@@ -13,7 +14,7 @@ def gather_annotated_frames(input_root: Path) -> pd.DataFrame:
         if 'frame.png' in files and 'background.png' in files:
             dirp = Path(dirpath)
             a = dirpath.split('/', -1)
-            fan_path = Path(a[0] + '/' + a[1] + '/' + a[2])
+            fan_path = Path(a[0] + '/' + a[1] + '/' + a[2] + '/' + a[3] + '/' + a[4] + '/' + a[5] + '/' + a[6] + '/' + a[7])
             rel = dirp.relative_to(input_root)
             if count == 0:
                 records.append({
@@ -94,6 +95,19 @@ def make_stratified_group_folds(
         
         print(f"=== Fold {fold_idx} ===")
         for name, split_df in (('TRAIN', train_df), ('VAL', val_df)):
+
+            counts = split_df.groupby('clinical_case').size()
+            plt.figure()
+            counts.hist(bins='auto')
+            plt.title(f'Fold {fold_idx} {name} Frame Count per Case')
+            plt.xlabel('Frame Count')
+            plt.ylabel('Number of case')
+
+            output_dir = output_root / f'fold_{fold_idx}' / name.lower()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            plt.savefig(output_dir / f'{name.lower()}_frame_count.png')
+            plt.close()
+
             dist = (
                 split_df['clinical_case']
                 .map(case_df.set_index('clinical_case')['histological'])
@@ -106,7 +120,7 @@ def make_stratified_group_folds(
             )
             print(f"{name} hist proportions:\n{dist.to_dict()}")
             print(f"{name} size‐bin proportions:\n{bin_dist.to_dict()}\n")
-
+        '''
         # Copy files
         fold_dir = output_root / f'fold_{fold_idx}'
         for split_name, subset in [('train', train_df), ('val', val_df)]:
@@ -122,14 +136,15 @@ def make_stratified_group_folds(
                     shutil.copy2(row['fan_path'], fan_path / 'fan.png')
                 shutil.copy2(row['frame_path'], dest / 'frame.png')
                 shutil.copy2(row['gt_path'],    dest / 'background.png')
+        '''
 
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    input_root = Path('Preliminary-data')
-    output_root = Path('Folds')
+    input_root = Path('/shared/tesi-signani-data/dataset-segmentation/raw_dataset/train')
+    output_root = Path('Folds_prova')
     csv_root = Path('clinical-cases-metadata-holsbeke.csv')
     parser.add_argument('--splits', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)

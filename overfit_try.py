@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from tqdm import tqdm
 import cfg
+from torchmetrics.classification import MulticlassJaccardIndex, Dice
 
 import pytorch_lightning as pl
 import yaml
@@ -30,21 +31,12 @@ from loss import *
 from torchvision.utils import save_image
 import wandb
 import misc2
+from create_train_data_multiclass import *
 
 args = cfg.parse_args()
 
 output_dir = 'logs'
-version_name='overfit'
-wandb.init(
-    project='Vivim_binary_segmentation',
-    name='overfit',
-    config=vars(args)
-)
-
-logger = WandbLogger(save_dir='.',
-                     name='Baseline',
-                     project='Vivim_binary_segmentation',
-                     log_model=True)
+version_name='multiclass segmentation'
 
 
 import matplotlib.pyplot as plt
@@ -59,45 +51,80 @@ from modeling.vivim import Vivim
 from poloy_metrics import *
 from modeling.utils import JointEdgeSegLoss
 # torch.set_float32_matmul_precision('high')
-from main_dataset import *
+from Multiclass_Data import *
 
 
-# === New wrapper to expose sample indices ===
-class IndexedDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-    def __len__(self):
-        return len(self.dataset)
-    def __getitem__(self, idx):
-        # return index along with original sample tuple
-        data = self.dataset[idx]
-        return idx, *data
+def multiclass_structure_loss(logits: torch.Tensor,
+                              targets: torch.Tensor,
+                              num_classes: int,
+                              eps: float = 1e-6) -> torch.Tensor:
+    """
+    logits:  [N, C, H, W]    raw scores for C classes
+    targets: [N, H, W]       integer labels in {0,1,…,C-1}
+    returns: scalar loss
+    """
+    N, C, H, W = logits.shape
+    # 1) convert targets to one–hot: [N, C, H, W]
+    targets_onehot = F.one_hot(targets.long(), num_classes=C) \
+                      .permute(0, 3, 1, 2).float()
 
-def structure_loss(pred, mask):
-    weit  = 1+5*torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15)-mask)
-    wbce  = F.binary_cross_entropy_with_logits(pred, mask, reduce='none')
-    
-    wbce  = (weit*wbce).sum(dim=(2,3))/weit.sum(dim=(2,3))
+    # 2) per-class weighted‐structure loss
+    losses = []
+    for c in range(C):
+        pred_c = logits[:, c:c+1, ...]           # [N,1,H,W]
+        mask_c = targets_onehot[:, c:c+1, ...]   # [N,1,H,W]
 
-    pred  = torch.sigmoid(pred)
-    inter = ((pred*mask)*weit).sum(dim=(2,3))
-    union = ((pred+mask)*weit).sum(dim=(2,3))
-    wiou  = 1-(inter+1)/(union-inter+1)
-    return (wbce+wiou).mean()
+        # spatial weight map
+        weit = 1 + 5 * torch.abs(
+            F.avg_pool2d(mask_c, kernel_size=31, stride=1, padding=15)
+            - mask_c
+        )
 
-def get_loader(args, mode):
-        full_dataset = MainDataset(root=args.data_path, trainsize=args.image_size, clip_len=args.clip_length)
-        indexed = IndexedDataset(full_dataset)
-        tiny_indices = list(range(5))
+        # weighted BCE
+        wbce = F.binary_cross_entropy_with_logits(
+            pred_c, mask_c, reduction='none'
+        )
+        wbce = (weit * wbce).sum(dim=(2,3)) / weit.sum(dim=(2,3))
 
-        tiny_dataset = Subset(indexed, tiny_indices)
-        train_loader = DataLoader(tiny_dataset,  batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
-        return train_loader
+        # weighted IoU
+        prob  = torch.sigmoid(pred_c)
+        inter = (prob * mask_c * weit).sum(dim=(2,3))
+        union = ((prob + mask_c) * weit).sum(dim=(2,3))
+        wiou  = 1 - (inter + eps) / (union - inter + eps)
+
+        # average over batch
+        losses.append((wbce + wiou).mean())
+
+    # 3) average over classes
+    return sum(losses) / C
+
+
+def get_loader(args, mode, num_fold):
+        input_root = 'Multiclass_Folds/fold_' + str(num_fold)
+
+        train_path = os.path.join(input_root, 'train')
+        train_output_root = 'Multiclass_TrainData_fold_' + str(num_fold)
+        train_output_root = os.path.join(train_output_root, 'train')
+        gather_multiclass_frames(Path(train_path), Path(train_output_root))
+        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length)
+
+        val_path = os.path.join(input_root, 'val')
+        val_output_root = 'Multiclass_TrainData_fold_' + str(num_fold)
+        val_output_root = os.path.join(val_output_root, 'val')
+        gather_multiclass_frames(Path(val_path), Path(val_output_root))
+        full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length)
+
+        if mode == 'training': 
+            train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            return train_loader
+        elif mode=='validation':
+            val_loader = DataLoader(full_val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            return val_loader
 
 
 class CoolSystem(pl.LightningModule):
     
-    def __init__(self, hparams):
+    def __init__(self, hparams, fold_number):
         super(CoolSystem, self).__init__()
 
         self.params = hparams
@@ -106,7 +133,9 @@ class CoolSystem(pl.LightningModule):
 
         self.train_batchsize = self.params.train_bs
         self.val_batchsize = self.params.val_bs
-    
+
+        self.fold_number = fold_number 
+        
         #Train setting
         self.initlr = self.params.initlr #initial learning rate
         self.weight_decay = self.params.weight_decay #optimizers weight decay
@@ -117,6 +146,8 @@ class CoolSystem(pl.LightningModule):
         self.val_aug = self.params.val_aug
         self.with_edge = self.params.with_edge
 
+        self.num_classes = self.params.num_classes
+
         self.gts = []
         self.preds = []
         
@@ -124,9 +155,17 @@ class CoolSystem(pl.LightningModule):
         self.upscale_factor = 1
         self.data_augmentation = True
 
-        self.criterion = JointEdgeSegLoss(classes=self.params.num_classes) if self.with_edge else structure_loss
+        self.criterion = JointEdgeSegLoss(classes=self.params.num_classes) if self.with_edge else multiclass_structure_loss
 
-        self.model = Vivim(with_edge=self.with_edge)
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.dice_loss = Dice(num_classes=self.num_classes, average="macro")
+        
+        # Metrics
+        self.train_jaccard = MulticlassJaccardIndex(num_classes=self.num_classes, average="macro")
+        self.val_jaccard   = MulticlassJaccardIndex(num_classes=self.num_classes, average="macro")
+        self.val_dice      = Dice(num_classes=self.num_classes, average="macro")
+
+        self.model = Vivim(with_edge=self.with_edge, out_chans=self.params.num_classes)
 
         self.save_hyperparameters()
 
@@ -134,7 +173,7 @@ class CoolSystem(pl.LightningModule):
     
     def configure_optimizers(self):
         #We filter the parameters that require gradients, avoid updating frozen parts
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,weight_decay=0.0)#,weight_decay=self.weight_decay)
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.999])#,weight_decay=self.weight_decay)
          
         # optimizer = Lion(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.99],weight_decay=0)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.initlr * 0.01)
@@ -167,180 +206,194 @@ class CoolSystem(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         self.model.train()
+        neighbor, target, _ = batch
+        logits = self.model(neighbor)  # → could be [B, C, H, W] or [B, T, C, H, W]
+        #print(logits.shape) #?torch.Size([3, 3, 256, 256])
+        # 1) If there's a time dimension, flatten it into the batch:
+
+        if logits.ndim == 5:
+            B, T, C, H, W = logits.shape
+            # reshape logits → [B*T, C, H, W]
+            logits = logits.view(B * T, C, H, W)
+            # replicate target across time → [B*T, H, W]
+            #target = target.unsqueeze(1).repeat(1, T, 1, 1).view(B * T, H, W)
+        if target.ndim == 5:
+            B, T, C, H, W = target.shape
+            # assume one-hot: [B, T, C, H, W]
+            # convert to class‐index mask: [B, T, H, W]
+            target = target.argmax(dim=2)
+        #print(target.shape) #[1, 3, 256, 256]
+        target = target.view(B*T, H, W)
+        #print(target.shape) torch.Size([3, 256, 256])
         
-        indices, neigbor, target, edge_gt = batch
-        target = target.cuda()
-        neigbor = neigbor.cuda()
+        #print(logits.shape) #torch.Size([3, 3, 256, 256])
+        #print(target.shape) #torch.Size([1, 3, 3, 256, 256])
+        loss_ce = self.criterion(logits, target, num_classes=self.num_classes)
+        # compute Dice loss (1 - Dice score)
+        dice_score = self.dice_loss(logits.softmax(dim=1), target)
+        loss = loss_ce + (1 - dice_score)
 
-        # Log sample IDs for leakage check
-        self.log('train/sample_ids', indices.float().mean(), on_step=True, prog_bar=False)
-
-        #print(neigbor.shape) #torch.Size([2, 3, 3, 256, 256])
-        #print(target.shape) #torch.Size([2, 3, 1, 256, 256])
-        
-        if len(neigbor.shape) == 5:
-            bz, nf, nc, h, w = target.shape
-        elif len(neigbor.shape) == 4:
-            bz, nc, h, w = neigbor.shape
-            nf = 1
-            neigbor = neigbor.unsqueeze(1)
-        else:
-            raise ValueError('Unexpected tensor shape for neigbor')
-        
-        if not self.with_edge:
-            pred = self.model(neigbor)
-            #print(pred.shape) 
-            target = target.reshape(bz*nf, nc, h, w)
-            loss = self.criterion(pred[self.nFrames//2::self.nFrames], target[self.nFrames//2::self.nFrames])
-
-        else:
-            pred, e0 = self.model(neigbor)
-            target = target.reshape(bz*nf, nc, h, w)
-            edge_gt = edge_gt.reshape(bz*nf, 1, h, w)
-            loss = self.criterion((pred[self.nFrames//2::self.nFrames], e0[self.nFrames//2::self.nFrames]), 
-                                   (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
-        self.log("train_loss", loss, prog_bar=True)
-        return {"loss": loss}
-
-    def on_validation_epoch_end(self):
-
-        self.sm = Smeasure()
-        self.em = Emeasure()
-        self.mae = MAE()
-
-        dice_lst, specificity_lst, precision_lst, recall_lst, f_measure_lst, jaccard_lst = [], [], [], [], [], []
-        Thresholds = np.linspace(1, 0, 256)
-        # print(Thresholds)
-
-        for pred, gt in zip(self.preds,self.gts):
-            # gt = gt.to(int)
-            #print(pred.shape) #shape = [1, 1, 256, 256]
-            #print(gt.shape) #shape = [3, 1, 256, 256]
-            self.sm.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
-            self.em.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
-            self.mae.step(pred.squeeze(0).squeeze(0).detach().cpu().numpy(),gt.squeeze(0).squeeze(0).detach().cpu().numpy())
-            gt = (gt>0.5).to(int)
-            dice_l, specificity_l, precision_l, recall_l, f_measure_l, jaccard_l = [], [], [], [], [], []
-            for j, threshold in enumerate(Thresholds):
-                # print(threshold)
-                pred_one_hot = (pred>threshold).to(int)
-                
-                dice, specificity, precision, recall, f_measure, jaccard = self.evaluate_one_img(pred_one_hot.detach().cpu().numpy(), gt.detach().cpu().numpy())
-                # print(dice)
-                dice_l.append(dice)
-                specificity_l.append(specificity)
-                precision_l.append(precision)
-                recall_l.append(recall)
-                f_measure_l.append(f_measure)
-                jaccard_l.append(jaccard)
-            dice_lst.append(sum(dice_l) / len(dice_l))
-            specificity_lst.append(sum(specificity_l) / len(specificity_l))
-            precision_lst.append(sum(precision_l) / len(precision_l))
-            recall_lst.append(sum(recall_l) / len(recall_l))
-            f_measure_lst.append(sum(f_measure_l) / len(f_measure_l))
-            jaccard_lst.append(sum(jaccard_l) / len(jaccard_l))
-
-
-            # print(sum(dice_l) / len(dice_l))
-
-        # mean
-        dice = sum(dice_lst) / len(dice_lst)
-        acc = sum(specificity_lst) / len(specificity_lst)
-        precision = sum(precision_lst) / len(precision_lst)
-        recall = sum(recall_lst) / len(recall_lst)
-        f_measure = sum(f_measure_lst) / len(f_measure_lst)
-        jac = sum(jaccard_lst) / len(jaccard_lst)
-
-        sm = self.sm.get_results()['Smeasure']
-        em = self.em.get_results()['meanEm']
-        mae = self.mae.get_results()['MAE']
-
-        #print(len(self.gts))
-        #print(len(self.preds))
-        
-        self.log('Dice',dice)
-        self.log('Jaccard',jac)
-        self.log('Precision',precision)
-        self.log('Recall',recall)
-        self.log('Fmeasure',f_measure)
-        self.log('specificity',acc)
-        self.log('Smeasure',sm)
-        self.log('Emeasure',em)
-        self.log('MAE',mae)
-
-        self.gts = []
-        self.preds = []
-
-        if self.trainer.current_epoch == 0:
-            # skip first epoch
-            pass
-        else:
-            print(f"Epoch {self.current_epoch}: Avg val loss = {torch.stack(self.val_losses).mean():.4f}")
-        self.val_losses.clear()
-
-        print("Val: Dice {0}, Jaccard {1}, Precision {2}, Recall {3}, Fmeasure {4}, specificity: {5}, Smeasure {6}, Emeasure {7}, MAE: {8}".format(dice,jac,precision,recall,f_measure,acc,sm,em,mae))
+        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/jaccard", self.train_jaccard(logits.softmax(dim=1), target), prog_bar=True)
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        # torch.set_grad_enabled(True)
         self.model.eval()
-        
-        indices, neigbor, target, _= batch
-        
-        # Log sample IDs in validation
-        #self.log('val/sample_ids', indices.float().mean(), on_step=True)
+        neighbor, target, _ = batch
+        logits = self.model(neighbor)  # → could be [B, C, H, W] or [B, T, C, H, W]
+        #print(logits.shape) #?torch.Size([3, 3, 256, 256])
+        # 1) If there's a time dimension, flatten it into the batch:
 
-        bz, nf, nc, h, w = neigbor.shape
+        if logits.ndim == 5:
+            B, T, C, H, W = logits.shape
+            # reshape logits → [B*T, C, H, W]
+            logits = logits.view(B * T, C, H, W)
+            # replicate target across time → [B*T, H, W]
+            #target = target.unsqueeze(1).repeat(1, T, 1, 1).view(B * T, H, W)
+        if target.ndim == 5:
+            B, T, C, H, W = target.shape
+            # assume one-hot: [B, T, C, H, W]
+            # convert to class‐index mask: [B, T, H, W]
+            target = target.argmax(dim=2)
+        #print(target.shape) #[1, 3, 256, 256]
+        target = target.view(B*T, H, W)
 
-        if not self.with_edge:
-            samples = self.model(neigbor)
-        else:
-            samples,_ = self.model(neigbor)
+        #print(target.shape) torch.Size([3, 256, 256])
+        #print(logits.shape) #torch.Size([3, 3, 256, 256])
 
-        #print('Samples shape: ',samples.shape) #torch.Size([3, 1, 256, 256])
+        loss = self.criterion(logits, target, num_classes=self.num_classes)
+        preds = logits.argmax(dim=1)  # [B*T or B, H, W]
 
-        samples = samples[self.nFrames//2::self.nFrames]
-
-
-        #print('Samples shape: ',samples.shape) #torch.Size([1, 1, 256, 256])
-
-        target = target.squeeze(0)
-        target = target[self.nFrames//2::self.nFrames]
-        #print('Target shape: ', target.shape) #torch.Size([1, 1, 256, 256])
-
-        loss = self.criterion(samples, target)
-        self.log('val_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
-        self.val_losses.append(loss.detach())
-
-        samples = torch.sigmoid(samples)
-        samples = (samples > 0.5).float()
-
-        filename = "sample_{}.png".format(batch_idx)
-        save_image(samples,os.path.join(self.save_path, filename))      
-        filename = "target_{}.png".format(batch_idx)
-        save_image(target,os.path.join(self.save_path, filename))
-
-        imgs = [samples.cpu(), target.cpu()]
-        captions = ["prediction", "ground_truth"]
-
-        # Log both images under one key
-        self.logger.log_image(
-            key="val_examples", 
-            images=imgs, 
-            caption=captions
+        # log image examples (unchanged)
+        sample_pred = preds[0].cpu().numpy()
+        sample_gt   = target[0].cpu().numpy()
+        pred_rgb = wandb.Image(
+            sample_pred,
+            masks={"prediction": {
+                "mask_data": sample_pred,
+                "class_labels": {i: f"class_{i}" for i in range(self.num_classes)}
+            }}
         )
-
-        self.preds.append(samples)
-        self.gts.append(target)
+        gt_rgb = wandb.Image(
+            sample_gt,
+            masks={"ground_truth": {
+                "mask_data": sample_gt,
+                "class_labels": {i: f"class_{i}" for i in range(self.num_classes)}
+            }}
+        )
+        self.logger.experiment.log(
+        {
+            "val_examples": [pred_rgb, gt_rgb],
+            "global_step": self.global_step  # so it shows up at the right step
+        }
+        )
+        # accumulate for epoch‐end
+        self.preds.append(preds.cpu())
+        self.gts.append(target.cpu())
+        self.val_losses.append(loss.detach)
 
         return loss
-       
 
+
+    def on_validation_epoch_end(self):
+        import numpy as np
+
+    def on_validation_epoch_end(self):
+        #Shape [total_samples, H, W]
+        all_preds = torch.cat(self.preds, dim=0).numpy()
+        all_gts   = torch.cat(self.gts,   dim=0).numpy()
+        C = self.num_classes
+
+        #For each class, we'll collect one S, one E, one MAE, etc.
+        sm_class = [Smeasure() for _ in range(C)]
+        em_class = [Emeasure() for _ in range(C)]
+        mae_class= [MAE()      for _ in range(C)]
+
+        # If you still want threshold‐based metrics like you did for binary:
+        thresholds = np.linspace(0, 1, 256)
+        dice_per_class      = [[] for _ in range(C)]
+        specificity_per_class = [[] for _ in range(C)]
+        precision_per_class   = [[] for _ in range(C)]
+        recall_per_class      = [[] for _ in range(C)]
+        fmeasure_per_class    = [[] for _ in range(C)]
+        jaccard_per_class     = [[] for _ in range(C)]
+
+        #Iterate over each sample
+        for pred_mask, gt_mask in zip(all_preds, all_gts):
+            # For each class c, build a binary mask
+            for c in range(C):
+                pred_c = (pred_mask == c).astype(np.uint8)
+                gt_c   = (gt_mask   == c).astype(np.uint8)
+
+                # Update structural metrics
+                sm_class[c].step(pred_c, gt_c)
+                em_class[c].step(pred_c, gt_c)
+                mae_class[c].step(pred_c, gt_c)
+
+                # Threshold‐sweep metrics
+                d_lst, s_lst, p_lst, r_lst, f_lst, j_lst = [], [], [], [], [], []
+                for t in thresholds:
+                    bin_pred = (pred_mask == c).astype(np.uint8)  # same as pred_c, but you could simulate uncertainty
+                    # If you had soft‐preds, you'd threshold them here
+                    dice, spec, prec, rec, fmeas, jacc = \
+                        self.evaluate_one_img(bin_pred, gt_c)
+                    d_lst.append(dice)
+                    s_lst.append(spec)
+                    p_lst.append(prec)
+                    r_lst.append(rec)
+                    f_lst.append(fmeas)
+                    j_lst.append(jacc)
+
+                # average over thresholds
+                dice_per_class[c].append(np.mean(d_lst))
+                specificity_per_class[c].append(np.mean(s_lst))
+                precision_per_class[c].append(np.mean(p_lst))
+                recall_per_class[c].append(np.mean(r_lst))
+                fmeasure_per_class[c].append(np.mean(f_lst))
+                jaccard_per_class[c].append(np.mean(j_lst))
+
+        #Compute per‐class and macro‐averages
+        logs = {}
+        for c in range(C):
+            logs[f"class_{c}/Smeasure"]     = sm_class[c].get_results()["Smeasure"]
+            logs[f"class_{c}/Emeasure"]     = em_class[c].get_results()["meanEm"]
+            logs[f"class_{c}/MAE"]          = mae_class[c].get_results()["MAE"]
+            logs[f"class_{c}/Dice"]         = np.mean(dice_per_class[c])
+            logs[f"class_{c}/Jaccard"]      = np.mean(jaccard_per_class[c])
+            logs[f"class_{c}/Precision"]    = np.mean(precision_per_class[c])
+            logs[f"class_{c}/Recall"]       = np.mean(recall_per_class[c])
+            logs[f"class_{c}/Fmeasure"]     = np.mean(fmeasure_per_class[c])
+            logs[f"class_{c}/Specificity"]  = np.mean(specificity_per_class[c])
+
+        # Macro‐average across classes
+        macro = lambda name: np.mean([logs[f"class_{c}/{name}"] for c in range(C)])
+        logs["macro/Smeasure"]    = macro("Smeasure")
+        logs["macro/Emeasure"]    = macro("Emeasure")
+        logs["macro/MAE"]         = macro("MAE")
+        logs["macro/Dice"]        = macro("Dice")
+        logs["macro/Jaccard"]     = macro("Jaccard")
+        logs["macro/Precision"]   = macro("Precision")
+        logs["macro/Recall"]      = macro("Recall")
+        logs["macro/Fmeasure"]    = macro("Fmeasure")
+        logs["macro/Specificity"] = macro("Specificity")
+
+        #Log everything
+        for k, v in logs.items():
+            # if you want them in TensorBoard / W&B via Lightning:
+            self.log(k, v, prog_bar=(k.startswith("macro/")), sync_dist=True)
+
+        #cleanup
+        self.preds.clear()
+        self.gts.clear()
+        self.val_losses.clear()
+
+    
     def train_dataloader(self):
-        train_loader = get_loader(self.params, mode='training')
+        train_loader = get_loader(self.params, mode='training', num_fold=self.fold_number)
         return train_loader
     
     def val_dataloader(self):
-        val_loader = get_loader(self.params, mode='validation')
+        val_loader = get_loader(self.params, mode='validation', num_fold=self.fold_number)
         return val_loader 
 
     def _compute_loss(self, neigbor, target, rest):
@@ -360,50 +413,59 @@ class CoolSystem(pl.LightningModule):
                                    (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
 
 def main():
+   
+    
+    for fold in range(args.num_folds):
+        wandb.init(
+        project='Vivim_multiclass_segmentation',
+        name='Vivim multiclass overfit',
+        config=vars(args)
+       )
 
-    #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
-    resume_checkpoint_path = args.resume_path
-    '''
-    rseed = args.seed
-    torch.manual_seed(rseed)
-    random.seed(rseed)
-    np.random.seed(rseed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(rseed)
-    torch.backends.cudnn.benchmark = True
-    '''
-    model = CoolSystem(args)
+        logger = WandbLogger(save_dir='.',
+                        name='Vivim multiclass overfit',
+                        project='Vivim_multiclass_segmentation',
+                        log_model=True)
+        pl.seed_everything(args.seed, workers=True)
+        
+        print('Start training for fold number ', fold)
 
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.p = 0.0
+        #resume_checkpoint_path = 'logs/vivim_OTU/version_35/checkpoints/ultra-epoch00-Dice-0.8606-Jaccard-0.7772.ckpt'
+        resume_checkpoint_path = args.resume_path
 
-    checkpoint_callback = ModelCheckpoint(
-    monitor='Dice',
-    #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
-    filename='ultra-epoch{epoch:02d}-Dice-{Dice:.4f}-Jaccard-{Jaccard:.4f}',
-    auto_insert_metric_name=False,   
-    every_n_epochs=1,
-    save_top_k=1,
-    mode = "max",
-    save_last=True
-    )
+        model = CoolSystem(args, fold_number=fold)
 
-    lr_monitor_callback = LearningRateMonitor(logging_interval='step')
-    trainer = pl.Trainer(
-    max_epochs=100,
-    overfit_batches=5,      # overfit on exactly 5 batches of train & val
-    accelerator='gpu',
-    devices=1,
-    precision=16,
-    logger=logger,
-    enable_progress_bar=True,
-)
+        checkpoint_callback = ModelCheckpoint(
+        monitor='macro/Dice',
+        #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
+        filename='ultra-epoch{epoch:02d}-macroDice-{macro/Dice:.4f}',
+        auto_insert_metric_name=False,   
+        every_n_epochs=1,
+        save_top_k=1,
+        mode = "max",
+        save_last=True
+        )
+
+        lr_monitor_callback = LearningRateMonitor(logging_interval='step')
+        trainer = pl.Trainer(
+            check_val_every_n_epoch=args.val_freq,
+            max_epochs=args.epochs,
+            accelerator='gpu',
+            devices=1,
+            overfit_batches=5,
+            precision=16,
+            logger=logger,
+            strategy="auto",
+            enable_progress_bar=True,
+            log_every_n_steps=5,
+            callbacks = [checkpoint_callback,lr_monitor_callback]
+        ) 
 
 
-    trainer.fit(model,ckpt_path=resume_checkpoint_path)
-    # val_path=r'/home/yijun/project/ultra/logs/uentm_polyp/version_60/checkpoints/ultra-epoch.ckpt'
-    # trainer.validate(model,ckpt_path=val_path)
+        trainer.fit(model,ckpt_path=resume_checkpoint_path)
+        # val_path=r'/home/yijun/project/ultra/logs/uentm_polyp/version_60/checkpoints/ultra-epoch.ckpt'
+        # trainer.validate(model,ckpt_path=val_path)
+        wandb.finish()
     
 if __name__ == '__main__':
-    main()  
+    main()

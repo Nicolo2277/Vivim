@@ -1,6 +1,6 @@
 from typing import Optional
 import os
-#os.environ['CUDA_VISIBLE_DEVICES'] = '3' Only in case if u have multiple GPUs and want to use a specific one
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1' #Only in case if u have multiple GPUs and want to use a specific one
 import numpy as np
 import copy
 from pytorch_lightning.utilities.types import EVAL_DATALOADERS, STEP_OUTPUT
@@ -34,18 +34,8 @@ from create_train_set import *
 
 args = cfg.parse_args()
 
-output_dir = 'logs'
+output_dir = 'Logs_with_max_num'
 version_name='binary segmentation'
-wandb.init(
-    project='Vivim_binary_segmentation',
-    name='binary segmentation',
-    config=vars(args)
-)
-
-logger = WandbLogger(save_dir='.',
-                     name='Baseline',
-                     project='Vivim_binary_segmentation',
-                     log_model=True)
 
 
 import matplotlib.pyplot as plt
@@ -62,6 +52,8 @@ from modeling.utils import JointEdgeSegLoss
 # torch.set_float32_matmul_precision('high')
 from main_dataset import *
 
+from val_loss_test import add_diagnostics_to_trainer
+
 
 def structure_loss(pred, mask):
     weit  = 1+5*torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15)-mask)
@@ -76,19 +68,19 @@ def structure_loss(pred, mask):
     return (wbce+wiou).mean()
 
 def get_loader(args, mode, num_fold):
-        input_root = 'Folds/fold_' + str(num_fold)
+        input_root = 'Multiclass_Folds/fold_' + str(num_fold)
 
         train_path = os.path.join(input_root, 'train')
         train_output_root = 'TrainData_fold_' + str(num_fold)
         train_output_root = os.path.join(train_output_root, 'train')
         gather_annotated_frames(Path(train_path), Path(train_output_root))
-        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length)
+        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity)
 
         val_path = os.path.join(input_root, 'val')
         val_output_root = 'TrainData_fold_' + str(num_fold)
         val_output_root = os.path.join(val_output_root, 'val')
         gather_annotated_frames(Path(val_path), Path(val_output_root))
-        full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length)
+        full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity)
 
         if mode == 'training': 
             train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
@@ -203,6 +195,13 @@ class CoolSystem(pl.LightningModule):
                                    (target[self.nFrames//2::self.nFrames], edge_gt[self.nFrames//2::self.nFrames]))
         self.log("train_loss", loss, prog_bar=True)
         return {"loss": loss}
+        
+    
+    def on_train_epoch_end(self):
+        '''Log learning rate after each epoch'''
+        current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        self.log('learning_rate', current_lr, on_step=False, on_epoch=True)
+
 
     def on_validation_epoch_end(self):
 
@@ -289,6 +288,7 @@ class CoolSystem(pl.LightningModule):
         
         neigbor, target, _= batch
 
+
         bz, nf, nc, h, w = neigbor.shape
 
         if not self.with_edge:
@@ -312,7 +312,8 @@ class CoolSystem(pl.LightningModule):
         #ONLY FOR Binary class !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         samples = torch.sigmoid(samples)
         samples = (samples > 0.5).float()
-
+        #Enable it when validating last epoch
+        '''
         filename = "sample_{}.png".format(batch_idx)
         save_image(samples,os.path.join(self.save_path, filename))      
         filename = "target_{}.png".format(batch_idx)
@@ -327,6 +328,7 @@ class CoolSystem(pl.LightningModule):
             images=imgs, 
             caption=captions
         )
+        '''
 
         self.preds.append(samples)
         self.gts.append(target)
@@ -359,9 +361,24 @@ class CoolSystem(pl.LightningModule):
 
 def main():
    
-    pl.seed_everything(args.seed, workers=True)
     
     for fold in range(args.num_folds):
+
+
+        wandb.init(
+        project='Vivim_binary_segmentation',
+        name=f'binary segmentation fold {fold}',
+        config=vars(args)
+        )
+
+        logger = WandbLogger(save_dir='.',
+                        name=f'binary segmentation fold {fold}',
+                        project='Vivim_binary_segmentation ',
+                        log_model=True)
+            
+        pl.seed_everything(args.seed, workers=True)
+
+
         
         print('Start training for fold number ', fold)
 
@@ -372,7 +389,7 @@ def main():
 
         checkpoint_callback = ModelCheckpoint(
         monitor='Dice',
-        #dirpath='/mnt/data/yt/Documents/TSANet-underwater/snapshots',
+        dirpath=output_dir,
         filename='ultra-epoch{epoch:02d}-Dice-{Dice:.4f}-Jaccard-{Jaccard:.4f}',
         auto_insert_metric_name=False,   
         every_n_epochs=1,
@@ -382,6 +399,7 @@ def main():
         )
 
         lr_monitor_callback = LearningRateMonitor(logging_interval='step')
+
         trainer = pl.Trainer(
             check_val_every_n_epoch=args.val_freq,
             max_epochs=args.epochs,
@@ -392,13 +410,16 @@ def main():
             strategy="auto",
             enable_progress_bar=True,
             log_every_n_steps=5,
-            callbacks = [checkpoint_callback,lr_monitor_callback]
+            callbacks = [checkpoint_callback,lr_monitor_callback],
         ) 
 
 
         trainer.fit(model,ckpt_path=resume_checkpoint_path)
-        # val_path=r'/home/yijun/project/ultra/logs/uentm_polyp/version_60/checkpoints/ultra-epoch.ckpt'
-        # trainer.validate(model,ckpt_path=val_path)
+        #trainer = add_diagnostics_to_trainer(trainer, model, val_loader)
+        #val_path=r'Logs/ultra-epoch39-fold-1.ckpt'
+        #trainer.validate(model,ckpt_path=val_path)
+
+        wandb.finish()
     
 if __name__ == '__main__':
     main()

@@ -165,10 +165,11 @@ def convert_mask(mask, max_obj):
 
 
 class MainDataset(Dataset):
-    def __init__(self, root, trainsize, clip_len=3):
+    def __init__(self, root, trainsize, clip_len=3, max_num=None):
         assert clip_len % 2 == 1 #it needs to be odd
         self.trainsize = trainsize
         self.clip_len = clip_len
+        self.max_num = max_num
         half = clip_len // 2
         
         #Add the fan to the training transforms
@@ -204,8 +205,9 @@ class MainDataset(Dataset):
             if N < clip_len:
                 print(f'The video contains only {N} frames and its too short')
                 continue  # skip too-short videos
+            
+            all_clips = []
 
-            # for each valid center index, collect its window
             for i in range(half, N - half, clip_len):
                 clip_paths = [
                     os.path.join(vid_dir, frames[j])
@@ -216,7 +218,17 @@ class MainDataset(Dataset):
                     os.path.join(vid_dir, gts[j])
                     for j in range(i - half, i + half + 1)
                     ]
-                self.samples.append((clip_paths, gt_paths))
+                all_clips.append((clip_paths, gt_paths))
+
+            if self.max_num is not None and len(all_clips) > self.max_num:
+                selected_clips = []
+                indices = np.linspace(0, len(all_clips) - 1, self.max_num, dtype=int)
+                for idx in indices:
+                    selected_clips.append(all_clips[idx])
+                self.samples.extend(selected_clips)
+            else:
+                self.samples.extend(all_clips)
+
 
         self.size = len(self.samples)
         print(f"Total clips: {self.size}")
@@ -224,14 +236,39 @@ class MainDataset(Dataset):
     def __len__(self):
         return self.size
     
+    def pad_or_crop_clip(self, clip_tensor):
+        """
+        clip_tensor: (T, C, H, W)
+        returns tensor of shape (self.clip_len, C, H, W)
+        """
+        T, C, H, W = clip_tensor.shape
+        if T == self.clip_len:
+            return clip_tensor
+
+        # If too long, crop a contiguous window
+        if T > self.clip_len:
+            start = random.randint(0, T - self.clip_len)
+            return clip_tensor[start:start + self.clip_len]
+        
+        # If too short, pad by repeating the last frame
+        pad_count = self.clip_len - T
+        last = clip_tensor[-1:].expand(pad_count, -1, -1, -1)  # (pad_count, C, H, W)
+        return torch.cat([clip_tensor, last], dim=0)
+    
     def __getitem__(self, idx): 
         clip_paths, gt_paths = self.samples[idx]
         #Here apply fan 
         frames = [Image.open(p).convert('RGB') for p in clip_paths]
         frames = [self.img_transform(im) for im in frames]
         clip_tensor = torch.stack(frames)  # (clip_len, C, H, W)
+        clip_tensor = self.pad_or_crop_clip(clip_tensor)
 
         gts = [Image.open(gt).convert('L') for gt in gt_paths]
+
+        T = clip_tensor.shape[0]
+        assert T == self.clip_len, (
+            f"Sample {idx} has wrong temporal length: {T} != {self.clip_len}"
+        )
 
         edge =  []
 
