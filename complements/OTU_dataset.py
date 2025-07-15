@@ -1,4 +1,4 @@
-'''Data loader for the OTU_2d dataset'''
+'''Data loader for the OTU_2d dataset (In case you want to use in the binary pretraining, currently not use as it is comprised of images, not videos, so no relevant temporal information)'''
 import os
 import numpy as np
 import glob

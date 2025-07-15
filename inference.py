@@ -1,3 +1,4 @@
+'Script for Vivim Multiclass Inference'
 import os
 import argparse
 import torch
@@ -11,25 +12,16 @@ import cv2
 import wandb
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import time
 
-# Import model and dataset classes
 from modeling.vivim import Vivim
 from Multiclass_Data import TestDataset
 from misc2 import dice, jaccard, precision, recall, fscore, specificity
-from create_train_data_multiclass import *
+from complements.create_train_data_multiclass import *
 
 # For visualization
 def visualize_prediction(image, pred, gt=None, save_path=None):
-    """
-    Visualize segmentation results
-    
-    Args:
-        image: RGB image [H,W,3]
-        pred: Prediction mask [H,W] with values in {0,1,2}
-        gt: Ground truth mask [H,W] with values in {0,1,2}, optional
-        save_path: Path to save visualization, optional
-    """
-    # Define colors for different classes (BGR format for OpenCV)
+
     colors = {
         0: [0, 0, 0],       # Background: black
         1: [0, 0, 255],     # Solid: red
@@ -86,14 +78,9 @@ def visualize_prediction(image, pred, gt=None, save_path=None):
         plt.show()
 
 def plot_confusion_matrix(conf_matrix, class_names, save_path=None):
-    """
-    Plot confusion matrix
     
-    Args:
-        conf_matrix: Confusion matrix
-        class_names: List of class names
-        save_path: Path to save the plot, optional
-    """
+    '''Plot confusion matrix'''
+    
     plt.figure(figsize=(10, 8))
     disp = ConfusionMatrixDisplay(
         confusion_matrix=conf_matrix,
@@ -110,16 +97,7 @@ def plot_confusion_matrix(conf_matrix, class_names, save_path=None):
         plt.show()
 
 def calculate_metrics(pred, gt):
-    """
-    Calculate comprehensive metrics for each class
-    
-    Args:
-        pred: Prediction mask [H,W] with values in {0,1,2}
-        gt: Ground truth mask [H,W] with values in {0,1,2}
-    
-    Returns:
-        Dictionary with metrics
-    """
+
     num_classes = 3
     class_names = ["background", "solid", "non_solid"]
     metrics = {
@@ -269,7 +247,6 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Initialize metrics
     all_metrics = {
         "dice": {
             "background": [], "solid": [], "non_solid": [], "mean": []
@@ -290,24 +267,33 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
             "background": [], "solid": [], "non_solid": [], "mean": []
         }
     }
+
+    dep_metrics = {
+        'inference_times' : [],
+    }
     
-    # Initialize confusion matrix
+    
     class_names = ["background", "solid", "non_solid"]
     num_classes = len(class_names)
     
     has_ground_truth = False
     
-    # List to store visualization samples
-    vis_samples = []
+    
+    vis_samples = {'images': [],
+                   'preds' : [],
+                   'targets': []}
     vis_filenames = []
     
-    # Lists to store all predictions and ground truths for pixel-wise confusion matrix
+   
     all_preds = []
     all_gts = []
+
+    total_frames = 0
+    total_time = 0.0
     
     with torch.no_grad():
         for i, batch in enumerate(tqdm(data_loader, desc="Running inference")):
-            # Unpack batch
+           
             if len(batch) == 3:  # Image, target, filename
                 images, targets, filenames = batch
                 has_ground_truth = True
@@ -315,25 +301,39 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
                 images, filenames = batch
                 has_ground_truth = False
             
-            # Move data to device
+          
             images = images.to(device)
             
-            # Forward pass
+            batch_size = images.shape[0]
+            if images.ndim == 5:
+                frames_per_batch = batch_size * images.shape[1]
+            else:
+                frames_per_batch = batch_size
+
+            start_time = time.time()
+           
             if model.with_edge:
                 logits, _ = model(images)
             else:
                 logits = model(images)
+            
+            inference_time = time.time() - start_time
+
+            dep_metrics['inference_times'].append(inference_time)
+
+            total_frames += frames_per_batch
+            total_time += inference_time
             
             # Handle temporal dimension if present
             if logits.ndim == 5:  # [B, T, C, H, W]
                 B, T, C, H, W = logits.shape
                 logits = logits.view(B*T, C, H, W)
             
-            # Get predictions (class indices)
+            # Get predictions 
             probs = F.softmax(logits, dim=1)
             preds = torch.argmax(probs, dim=1).cpu().numpy()
             
-            # Process each image in the batch
+            
             for j in range(preds.shape[0]):
                 # Get prediction for this image
                 pred = preds[j]
@@ -344,8 +344,6 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
                 else:
                     filename = filenames[0]
                 
-                # For visualization, get the original image
-                # Handle different tensor dimensions (3D or 4D)
                 #print(images.shape) #torch.Size([5, 3, 256, 256])
                 #print(preds.shape) #torch.Size([5, 256, 256])
                 images = images.squeeze()
@@ -377,49 +375,70 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
                     
                     gt = targets[j].cpu().numpy()
                     
-                    # Store predictions and ground truths for confusion matrix
                     all_preds.append(pred.flatten())
                     all_gts.append(gt.flatten())
                     
-                    # Calculate metrics
                     metrics = calculate_metrics(pred, gt)
                     
-                    # Accumulate metrics
                     for metric_type in all_metrics:
                         for class_name in metrics[metric_type]:
                             all_metrics[metric_type][class_name].append(metrics[metric_type][class_name])
                     
-                    # Potentially add to visualization samples
-                    if len(vis_samples) < vis_count:
-                        vis_samples['images'].append(img[0].detach().cpu())
-                        vis_samples['preds'].append(pred[0].detach().cpu())
-                        vis_samples['targets'].append(gt[0].detach().cpu())
+                    if len(vis_samples['images']) < vis_count:
+                        vis_samples['images'].append(img)
+                        vis_samples['preds'].append(pred)
+                        vis_samples['targets'].append(gt)
+                        print(f'Image visualization: {filename}')
                     
-                    # Save visualization locally if needed
+                    
                     if save_vis:
                         vis_path = os.path.join(output_dir, f"{Path(filename).stem}_vis.png")
                         visualize_prediction(img, pred, gt, save_path=vis_path)
                 else:
-                    # Add to visualization samples without ground truth
-                    if len(vis_samples) < vis_count:
+                    
+                    if len(vis_samples['images']) < vis_count:
                         vis_samples.append((img, pred, None))
                         vis_filenames.append(filename)
+                        
                     
-                    # Save visualization locally without ground truth
+                    
                     if save_vis:
                         vis_path = os.path.join(output_dir, f"{Path(filename).stem}_vis.png")
                         visualize_prediction(img, pred, save_path=vis_path)
                 
-                # Save prediction mask
-
-                pred_path = os.path.join(output_dir, f"{Path(filename[0]).stem}_pred.png")
-                cv2.imwrite(pred_path, pred.astype(np.uint8))
+                
+                if save_vis:
+                    pred_path = os.path.join(output_dir, f"{Path(filename[0]).stem}_pred.png")
+                    cv2.imwrite(pred_path, pred.astype(np.uint8))
+                    
+    fps = total_frames / total_time if total_time > 0 else 0
     
-    # Calculate overall metrics if ground truth is available and log to wandb
+    batch_inference_time = np.array(dep_metrics['inference_times'])
+
+    dep_summary = {
+        'fps': fps,
+        'avg_inference_time_per_batch': np.mean(batch_inference_time),
+        'min_inference_time': np.min(batch_inference_time),
+        'max_inference_time': np.max(batch_inference_time),
+        'total_frames_processed': total_frames,
+        'total_inference_time': inference_time
+    }
+
+    print('\nDep Metrics: ')
+    print(f'FPS: {fps:.2f}')
+    print(f"Average inference time per batch: {dep_summary['avg_inference_time_per_batch'] * 1000:.2f} ms")
+
+    if use_wandb:
+        wandb.log({
+            'fps': fps,
+            'avg_inference_time_ms': dep_summary['avg_inference_time_per_batch'] * 1000,
+            'total_inference_time': total_time
+        })
+
     if has_ground_truth and len(all_metrics["dice"]["mean"]) > 0:
         final_metrics = {}
 
-        # Calculate overall metrics
+        
         for metric_type in all_metrics:
             final_metrics[metric_type] = {
                 "background": np.mean(all_metrics[metric_type]["background"]),
@@ -428,16 +447,16 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
                 "mean": np.mean(all_metrics[metric_type]["mean"])
             }
         
-        # Compute confusion matrix on all pixels
+        
         all_preds_flat = np.concatenate(all_preds)
         all_gts_flat = np.concatenate(all_gts)
         conf_matrix = confusion_matrix(all_gts_flat, all_preds_flat, labels=list(range(num_classes)))
         
-        # Save confusion matrix plot
+        
         cm_path = os.path.join(output_dir, "confusion_matrix.png")
         plot_confusion_matrix(conf_matrix, class_names, save_path=cm_path)
 
-        # Print metrics
+        
         print("\nOverall Metrics:")
         print(f"Mean Dice: {final_metrics['dice']['mean']:.4f}")
         print(f"Mean Jaccard: {final_metrics['jaccard']['mean']:.4f}")
@@ -456,18 +475,17 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
             print(f"  F-measure: {final_metrics['f_measure'][class_name]:.4f}")
             print(f"  Specificity: {final_metrics['specificity'][class_name]:.4f}")
         
-        # Log to wandb if enabled
+        
         if use_wandb:
-            # Flatten metrics for wandb
+            
             wandb_metrics = {}
             for metric_type in final_metrics:
                 for class_name in final_metrics[metric_type]:
                     wandb_metrics[f"{metric_type}_{class_name}"] = final_metrics[metric_type][class_name]
             
-            # Log metrics
+            
             wandb.log(wandb_metrics)
             
-            # Log confusion matrix to wandb
             cm_fig = plt.figure(figsize=(10, 8))
             disp = ConfusionMatrixDisplay(
                 confusion_matrix=conf_matrix,
@@ -480,7 +498,6 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
             wandb.log({"confusion_matrix": wandb.Image(cm_fig)})
             plt.close(cm_fig)
             
-            # Create a normalized confusion matrix for better visualization of patterns
             row_sums = conf_matrix.sum(axis=1)
             # Avoid division by zero
             #row_sums[row_sums == 0] = 1
@@ -515,75 +532,69 @@ def run_inference(model, data_loader, device, output_dir, save_vis, vis_count=20
             plt.close(norm_cm_fig)
 
             if len(vis_samples['images']) > 0:
-                # Visualization helper function
-                def visualize_samples(images, preds, targets, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
-                    """Create grid of images with predictions and ground truth"""
-                    num_samples = len(images)
-                    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
-                    
-                    if num_samples == 1:
-                        axes = axes.reshape(1, -1)
+
+                def visualize_samples(images, preds, targets):
+                        """Create grid of images with predictions and ground truth"""
                         
-                    class_colors = [
-                        [0, 0, 0],       # background - black
-                        [255, 0, 0],     # solid - red
-                        [0, 0, 255]      # non-solid - blue
-                    ]
-                    
-                    for i in range(num_samples):
-                        # Original image
-                        img = images[i].numpy()
-                        for c in range(3):
-                            img[c] = img[c] * std[c] + mean[c]
-                        img = np.clip(img.transpose(1, 2, 0), 0, 1)
-                        axes[i, 0].imshow(img)
-                        axes[i, 0].set_title("Original Image")
-                        axes[i, 0].axis('off')
+                        num_samples = len(images)
+                        fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
                         
-                        # Ground truth
-                        mask_vis = np.zeros((targets[i].shape[1], targets[i].shape[2], 3))
-                        target_cls = targets[i].argmax(dim=0).numpy()
-                        for c in range(C):
-                            mask_vis[target_cls == c] = np.array(class_colors[c]) / 255.0
-                        axes[i, 1].imshow(mask_vis)
-                        axes[i, 1].set_title("Ground Truth")
-                        axes[i, 1].axis('off')
+                        if num_samples == 1:
+                            axes = axes.reshape(1, -1)
+                            
+                        class_colors = [
+                            [0, 0, 0],       # background - black
+                            [255, 0, 0],     # solid - red
+                            [255, 255, 0]    # non-solid - yellow
+                        ]
                         
-                        # Prediction
-                        pred_vis = np.zeros((preds[i].shape[1], preds[i].shape[2], 3))
-                        pred_cls = preds[i].argmax(dim=0).numpy()
-                        for c in range(C):
-                            pred_vis[pred_cls == c] = np.array(class_colors[c]) / 255.0
-                        axes[i, 2].imshow(pred_vis)
-                        axes[i, 2].set_title("Prediction")
-                        axes[i, 2].axis('off')
-                    
-                    plt.tight_layout()
-                    return fig
+                        for i in range(num_samples):
+                            # Original image - images[i] is already a numpy array with shape (H, W, 3)
+                            axes[i, 0].imshow(images[i])
+                            axes[i, 0].set_title("Original Image")
+                            axes[i, 0].axis('off')
+                            
+                            # Prediction visualization
+                            pred_vis = np.zeros((preds[i].shape[0], preds[i].shape[1], 3), dtype=np.uint8)
+                            for c in range(len(class_colors)):
+                                pred_vis[preds[i] == c] = class_colors[c]
+                            axes[i, 1].imshow(pred_vis)
+                            axes[i, 1].set_title("Prediction")
+                            axes[i, 1].axis('off')
+                            
+                            # Ground truth
+                            gt_vis = np.zeros((targets[i].shape[0], targets[i].shape[1], 3), dtype=np.uint8)
+                            for c in range(len(class_colors)):
+                                gt_vis[targets[i] == c] = class_colors[c]
+                            axes[i, 2].imshow(gt_vis)
+                            axes[i, 2].set_title("Ground Truth")
+                            axes[i, 2].axis('off')
+                        
+                        plt.tight_layout()
+                        return fig
                 
-                # Create visualization figure
                 vis_fig = visualize_samples(
                     vis_samples['images'], 
                     vis_samples['preds'], 
                     vis_samples['targets']
                 )
                 
-                # Log to wandb
+                
                 wandb.log({'val/sample_predictions': wandb.Image(vis_fig)})
                 plt.close(vis_fig)
                 
-        # Add confusion matrix data to final metrics
+       
         final_metrics["confusion_matrix"] = conf_matrix.tolist()
+
+        final_metrics['DEP'] = dep_summary
 
         return final_metrics
     
     return None
 
 def main():
-    # Parse arguments
     args = parse_args()
     
-    # Set device
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}")
     else:
@@ -591,7 +602,7 @@ def main():
         
     print(f"Using device: {device}")
     
-    # Initialize wandb if enabled
+
     if args.wandb:
         wandb.init(
             project=args.wandb_project,
@@ -599,7 +610,7 @@ def main():
             config=vars(args)
         )
     
-    # Prepare test data
+   
     test_loader = prepare_test_data(
         args.data_dir, 
         args.image_size, 
@@ -607,7 +618,7 @@ def main():
         args.batch_size,
     )
     
-    # Load model
+    
     model = load_model(
         args.ckpt, 
         args.with_edge, 
@@ -615,7 +626,6 @@ def main():
         device
     )
     
-    # Run inference
     metrics = run_inference(
         model, 
         test_loader, 
@@ -626,7 +636,7 @@ def main():
         args.wandb
     )
     
-    # Save metrics if available
+    
     if metrics:
         import json
         metrics_path = os.path.join(args.output_dir, "metrics.json")
@@ -634,7 +644,6 @@ def main():
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to {metrics_path}")
     
-    # Close wandb run
     if args.wandb:
         wandb.finish()
 

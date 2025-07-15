@@ -1,3 +1,4 @@
+'''Script for training Vivim multiclass on a k-fold Cross Validation'''
 from typing import Optional
 import os
 #os.environ['CUDA_VISIBLE_DEVICES'] = '3' Only in case if u have multiple GPUs and want to use a specific one
@@ -12,6 +13,8 @@ from tqdm import tqdm
 import cfg
 from torchmetrics.classification import MulticlassJaccardIndex
 from torchmetrics.segmentation import DiceScore
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
 from torchmetrics.segmentation import DiceScore
 
@@ -28,14 +31,14 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import WandbLogger
 from argparse import Namespace
 
-from OTU_dataset import *
+from complements.OTU_dataset import *
 from torch.utils.data import DataLoader, Subset
 from loss import *
 # from models2.refinenet import RefineNet
 from torchvision.utils import save_image
 import wandb
 import misc2
-from create_train_data_multiclass import *
+from complements.create_train_data_multiclass import *
 
 args = cfg.parse_args()
 
@@ -59,17 +62,13 @@ from Multiclass_Data import *
 
 
 class MulticlassMetricsTracker:
-    """
-    Track metrics for individual classes, handling cases where classes may not be present.
-    Only includes classes that are actually present in the calculation of means.
-    """
+
     def __init__(self, num_classes=3):
         self.num_classes = num_classes
         self.reset()
        
     def reset(self):
-        # For each class, we'll store a list of metric values
-        # Only when that class is present in an image
+       
         self.dice_per_class = [[] for _ in range(self.num_classes)]
         self.jaccard_per_class = [[] for _ in range(self.num_classes)]
         self.precision_per_class = [[] for _ in range(self.num_classes)]
@@ -77,45 +76,38 @@ class MulticlassMetricsTracker:
         self.f_measure_per_class = [[] for _ in range(self.num_classes)]
         self.specificity_per_class = [[] for _ in range(self.num_classes)]
        
-        # Count how many times each class appears
+        
         self.class_counts = [0 for _ in range(self.num_classes)]
        
     def update(self, pred, gt):
-        """
-        Update metrics for each class that is present in the ground truth
-       
-        Args:
-            pred: Predicted tensor with shape [B, C, H, W] or [C, H, W]
-            gt: Ground truth tensor with shape [B, H, W] or [H, W] with class indices
-        """
-        # Ensure we're working with numpy arrays
+
         if torch.is_tensor(pred):
             pred = pred.detach().cpu().numpy()
         if torch.is_tensor(gt):
             gt = gt.detach().cpu().numpy()
        
-        # Flatten batch dimension if present
+        
         if pred.ndim == 4:  # [B, C, H, W]
             B, C, H, W = pred.shape
             pred = pred.reshape(-1, C, H, W)
             gt = gt.reshape(-1, H, W)
            
-        # For each sample in the batch
+        
         for sample_idx in range(len(pred)):
             sample_pred = pred[sample_idx]  # [C, H, W]
             sample_gt = gt[sample_idx]      # [H, W]
            
-            # For each class
+            
             for class_idx in range(self.num_classes):
-                # Check if this class is present in the ground truth
+                
                 if np.any(sample_gt == class_idx):
                     self.class_counts[class_idx] += 1
                    
-                    # Create binary masks for this class
+                    
                     pred_binary = (sample_pred.argmax(axis=0) == class_idx).astype(np.int32)
                     gt_binary = (sample_gt == class_idx).astype(np.int32)
                    
-                    # Calculate metrics for this class
+                    
                     dice = misc2.dice(pred_binary, gt_binary)
                     jaccard = misc2.jaccard(pred_binary, gt_binary)
                     precision = misc2.precision(pred_binary, gt_binary)
@@ -123,7 +115,7 @@ class MulticlassMetricsTracker:
                     f_measure = misc2.fscore(pred_binary, gt_binary)
                     specificity = misc2.specificity(pred_binary, gt_binary)
                    
-                    # Store metrics
+                    
                     self.dice_per_class[class_idx].append(dice)
                     self.jaccard_per_class[class_idx].append(jaccard)
                     self.precision_per_class[class_idx].append(precision)
@@ -132,8 +124,7 @@ class MulticlassMetricsTracker:
                     self.specificity_per_class[class_idx].append(specificity)
    
     def get_results(self):
-        """Get average metrics across all classes"""
-        # Calculate mean for each metric, only including classes that appeared
+        
         dice_values = [np.mean(self.dice_per_class[i]) if self.class_counts[i] > 0 else None
                      for i in range(self.num_classes)]
        
@@ -152,12 +143,12 @@ class MulticlassMetricsTracker:
         specificity_values = [np.mean(self.specificity_per_class[i]) if self.class_counts[i] > 0 else None
                             for i in range(self.num_classes)]
        
-        # Calculate overall averages (ignoring None values)
+        
         def safe_mean(values):
             valid_values = [v for v in values if v is not None]
             return np.mean(valid_values) if valid_values else 0.0
        
-        # Pack results
+        
         results = {
             'dice': {
                 'per_class': dice_values,
@@ -188,44 +179,186 @@ class MulticlassMetricsTracker:
        
         return results
 
-def combo_loss(logits, targets, num_classes, alpha=0.5, smooth=1e-6):
+def dice_loss(logits, targets, num_classes, smooth=1e-6):
     """
-    Combination of Cross-Entropy and Dice Loss
+    Dice loss for multiclass segmentation
     
     Args:
         logits: [N, C, H, W] raw scores for C classes
-        targets: [N, H, W] integer labels in {0,1,…,C-1}
+        targets: [N, H, W] integer labels in {0,1,...,C-1}
         num_classes: Number of classes
-        alpha: Weight factor between CE and Dice (0.5 means equal weighting)
-        smooth: Smoothing factor to avoid division by zero
+        smooth: Smoothing factor
         
     Returns: scalar loss
     """
-    # Convert targets to one-hot encoding
     N, C, H, W = logits.shape
+    
+    # Convert predictions to probabilities
+    probs = F.softmax(logits, dim=1)
+    
+    # One-hot encode targets
     targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
     
-    # Cross-Entropy Loss
-    ce_loss = F.cross_entropy(logits, targets)
-    
-    # Dice Loss
-    probs = F.softmax(logits, dim=1)
-    dice_losses = []
-    
+    # Calculate Dice for each class
+    dice_scores = []
     for c in range(C):
         pred_c = probs[:, c, ...]
-        target_c = targets_onehot[:, c, ...]
+        targ_c = targets_onehot[:, c, ...]
         
-        intersection = (pred_c * target_c).sum(dim=(1, 2))
-        union = pred_c.sum(dim=(1, 2)) + target_c.sum(dim=(1, 2))
+        # Calculate intersection and union
+        intersection = (pred_c * targ_c).sum(dim=(1, 2))
+        union = pred_c.sum(dim=(1, 2)) + targ_c.sum(dim=(1, 2))
         
-        dice_loss_c = 1 - (2 * intersection + smooth) / (union + smooth)
-        dice_losses.append(dice_loss_c.mean())
+        # Dice formula
+        dice_c = (2. * intersection + smooth) / (union + smooth)
+        dice_scores.append(1 - dice_c.mean())  # Convert to loss
     
-    dice_loss = sum(dice_losses) / C
+    return sum(dice_scores) / C  # Average across classes
+
+def tversky_loss(logits, targets, num_classes, alpha=0.3, beta=0.7, smooth=1e-6):
+    """
+    Tversky loss with beta > alpha to prioritize recall
     
-    # Combine losses
-    return alpha * ce_loss + (1 - alpha) * dice_loss
+    Args:
+        logits: [N, C, H, W] raw scores for C classes
+        targets: [N, H, W] integer labels in {0,1,...,C-1}
+        num_classes: Number of classes
+        alpha: Weight for false positives
+        beta: Weight for false negatives (higher value prioritizes recall)
+        smooth: Smoothing factor
+        
+    Returns: scalar loss
+    """
+    N, C, H, W = logits.shape
+    
+    # Convert predictions to probabilities
+    probs = F.softmax(logits, dim=1)
+    
+    # One-hot encode targets
+    targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
+    
+    # Calculate Tversky for each class
+    tversky_scores = []
+    for c in range(C):
+        pred_c = probs[:, c, ...]
+        targ_c = targets_onehot[:, c, ...]
+        
+        # Calculate true positives, false positives, false negatives
+        tp = (pred_c * targ_c).sum(dim=(1, 2))
+        fp = (pred_c * (1 - targ_c)).sum(dim=(1, 2))
+        fn = ((1 - pred_c) * targ_c).sum(dim=(1, 2))
+        
+        # Tversky formula
+        tversky_c = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        tversky_scores.append(1 - tversky_c.mean())  # Convert to loss
+    
+    return sum(tversky_scores) / C  # Average across classes
+
+def boundary_aware_loss(logits, targets, num_classes, weight=0.5):
+    """
+    Boundary-aware loss that gives more weight to edge pixels
+    
+    Args:
+        logits: [N, C, H, W] raw scores for C classes
+        targets: [N, H, W] integer labels in {0,1,...,C-1}
+        num_classes: Number of classes
+        weight: Weight for boundary loss
+        
+    Returns: scalar loss
+    """
+    import torch.nn.functional as F
+    
+    N, C, H, W = logits.shape
+    
+    # Convert targets to one-hot
+    targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
+    
+    # Calculate boundary masks using simple gradient operation
+    boundary_masks = []
+    for c in range(C):
+        targ_c = targets_onehot[:, c, ...]
+        
+        # Calculate gradient in X and Y directions
+        grad_x = torch.abs(targ_c[:, :, 1:] - targ_c[:, :, :-1])
+        grad_y = torch.abs(targ_c[:, 1:, :] - targ_c[:, :-1, :])
+        
+        # Pad gradients to match original size
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))
+        
+        # Combine to get boundary mask
+        boundary = torch.clamp(grad_x + grad_y, 0, 1)
+        boundary_masks.append(boundary)
+    
+    # Stack boundary masks
+    boundary_masks = torch.stack(boundary_masks, dim=1)
+    
+    # Calculate weighted BCE loss with boundary emphasis
+    probs = F.softmax(logits, dim=1)
+    interior_loss = F.cross_entropy(logits, targets)
+    
+    # For boundary pixels, calculate weighted BCE
+    boundary_loss = 0
+    for c in range(C):
+        pred_c = probs[:, c, ...]
+        targ_c = targets_onehot[:, c, ...]
+        bound_c = boundary_masks[:, c, ...]
+        
+        # Calculate BCE weighted by boundary mask
+        bce = -targ_c * torch.log(pred_c + 1e-6) - (1 - targ_c) * torch.log(1 - pred_c + 1e-6)
+        boundary_loss += (bound_c * bce).mean()
+    
+    boundary_loss /= C
+    
+    # Combined loss
+    return interior_loss + weight * boundary_loss
+
+def combined_focal_dice_loss(logits, targets, num_classes, gamma=3.0, alpha=None, dice_weight=0.5):
+    """
+    Combined focal and dice loss for improved segmentation
+    
+    Args:
+        logits: [N, C, H, W] raw scores for C classes
+        targets: [N, H, W] integer labels in {0,1,...,C-1}
+        num_classes: Number of classes
+        gamma: Focusing parameter for focal loss
+        alpha: Class weights for focal loss (None for automatic)
+        dice_weight: Weight for dice loss component
+        
+    Returns: scalar loss
+    """
+    # Calculate focal loss with explicit alpha (if provided)
+    focal = class_balanced_focal_loss(logits, targets, num_classes, gamma=gamma, alpha=alpha)
+    
+    # Calculate dice loss
+    dice = dice_loss(logits, targets, num_classes)
+    
+    # Combined weighted loss (adjust weights as needed)
+    return (1.0 - dice_weight) * focal + dice_weight * dice
+
+def recall_focused_loss(logits, targets, num_classes, gamma=2.0):
+    """
+    Loss function specifically designed to improve recall
+    
+    Args:
+        logits: [N, C, H, W] raw scores for C classes
+        targets: [N, H, W] integer labels in {0,1,...,C-1}
+        num_classes: Number of classes
+        gamma: Focusing parameter
+        
+    Returns: scalar loss
+    """
+    # Strong class weighting to prioritize minority classes
+    alpha = [0.05, 0.475, 0.475]  # [background, solid, non-solid]
+    
+    # Use Tversky loss with beta>alpha to prioritize recall
+    tversky = tversky_loss(logits, targets, num_classes, alpha=0.3, beta=0.7)
+    
+    # Calculate focal loss with explicit alpha
+    focal = class_balanced_focal_loss(logits, targets, num_classes, gamma=gamma, alpha=alpha)
+    
+    # Weighted combination prioritizing tversky loss for better recall
+    return 0.4 * focal + 0.6 * tversky
 
 def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=None):
     """
@@ -241,6 +374,10 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
     Returns: scalar loss
     """
     N, C, H, W = logits.shape
+
+    #print(logits.shape) #[16, 3, 256, 256]
+    #print(targets.shape) #[16, 256, 256]
+    
     
     # If no specific class weights are provided, calculate them based on inverse frequency
     if alpha is None:
@@ -249,12 +386,17 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
         for c in range(num_classes):
             class_counts.append((targets == c).sum().float() + 1e-6)  # Add small eps to avoid div by 0
         
+            #print("Class counts:", [count.item() for count in class_counts])
+
         # Inverse frequency as weight
         total_pixels = N * H * W
         class_weights = total_pixels / (num_classes * torch.tensor(class_counts).to(logits.device))
         
         # Normalize weights to sum to 1
         alpha = class_weights / class_weights.sum()
+
+        #print("Automatically calculated alpha values:", [weight.item() for weight in alpha])
+    
     else:
         alpha = torch.tensor(alpha).to(logits.device)
     
@@ -279,51 +421,6 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
         focal_losses.append(class_loss)
     
     return sum(focal_losses)
-
-
-def multiclass_structure_loss(logits: torch.Tensor,
-                              targets: torch.Tensor,
-                              num_classes: int,
-                              eps: float = 1e-6) -> torch.Tensor:
-    """
-    logits:  [N, C, H, W]    raw scores for C classes
-    targets: [N, H, W]       integer labels in {0,1,…,C-1}
-    returns: scalar loss
-    """
-    N, C, H, W = logits.shape
-    # 1) convert targets to one–hot: [N, C, H, W]
-    targets_onehot = F.one_hot(targets.long(), num_classes=C) \
-                      .permute(0, 3, 1, 2).float()
-
-    # 2) per-class weighted‐structure loss
-    losses = []
-    for c in range(C):
-        pred_c = logits[:, c:c+1, ...]           # [N,1,H,W]
-        mask_c = targets_onehot[:, c:c+1, ...]   # [N,1,H,W]
-
-        # spatial weight map
-        weit = 1 + 5 * torch.abs(
-            F.avg_pool2d(mask_c, kernel_size=31, stride=1, padding=15)   #could try with 15, 7
-            - mask_c
-        )
-
-        # weighted BCE
-        wbce = F.binary_cross_entropy_with_logits(
-            pred_c, mask_c, reduction='none'
-        )
-        wbce = (weit * wbce).sum(dim=(2,3)) / weit.sum(dim=(2,3))
-
-        # weighted IoU
-        prob  = torch.sigmoid(pred_c)
-        inter = (prob * mask_c * weit).sum(dim=(2,3))
-        union = ((prob + mask_c) * weit).sum(dim=(2,3))
-        wiou  = 1 - (inter + eps) / (union - inter + eps)
-
-        # average over batch
-        losses.append((wbce + wiou).mean())
-
-    # 3) average over classes
-    return sum(losses) / C
 
 
 def get_loader(args, mode, num_fold):
@@ -377,17 +474,19 @@ class CoolSystem(pl.LightningModule):
 
         self.gts = []
         self.preds = []
+
+        self.all_targets = []
+        self.all_preds = []
         
         self.nFrames = self.params.clip_length
         self.upscale_factor = 1
         self.data_augmentation = True
 
-        self.criterion = JointEdgeSegLoss(classes=self.params.num_classes) if self.with_edge else combo_loss
+        self.criterion = JointEdgeSegLoss(classes=self.params.num_classes) if self.with_edge else recall_focused_loss
 
         self.ce_loss = nn.CrossEntropyLoss()
         self.dice_loss = DiceScore(num_classes=self.num_classes, average='macro')
         
-        # Metrics
         self.train_jaccard = MulticlassJaccardIndex(num_classes=self.num_classes, average="micro")
         self.val_jaccard   = MulticlassJaccardIndex(num_classes=self.num_classes, average="micro")
         self.val_dice      = DiceScore(num_classes=self.num_classes, average="macro", )
@@ -411,7 +510,7 @@ class CoolSystem(pl.LightningModule):
 
         # optimizer = Lion(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.99],weight_decay=0)
 
-        #Added a warmup scheduler to improve the model convergence  
+        #Added a scheduler to improve the model convergence  
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.initlr * 0.01)
 
@@ -444,15 +543,14 @@ class CoolSystem(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.model.train()
         neighbor, target, _ = batch
-        logits = self.model(neighbor)  # → could be [B, C, H, W] or [B, T, C, H, W]
+        logits = self.model(neighbor)  #  could be [B, C, H, W] or [B, T, C, H, W]
         #print(logits.shape) #?torch.Size([3, 3, 256, 256])
-        # 1) If there's a time dimension, flatten it into the batch:
 
         if logits.ndim == 5:
             B, T, C, H, W = logits.shape
-            # reshape logits → [B*T, C, H, W]
+            # reshape logits [B*T, C, H, W]
             logits = logits.view(B * T, C, H, W)
-            # replicate target across time → [B*T, H, W]
+            # replicate target across time  [B*T, H, W]
             #target = target.unsqueeze(1).repeat(1, T, 1, 1).view(B * T, H, W)
         if target.ndim == 5:
             B, T, C, H, W = target.shape
@@ -465,7 +563,7 @@ class CoolSystem(pl.LightningModule):
         
         #print(logits.shape) #torch.Size([3, 3, 256, 256])
         #print(target.shape) #torch.Size([1, 3, 3, 256, 256])
-        loss_combo = combo_loss(logits, target, num_classes=self.num_classes)
+        loss_combo = recall_focused_loss(logits, target, num_classes=self.num_classes)
         # compute Dice loss (1 - Dice score)
         #dice_score = self.dice_loss(logits.softmax(dim=1), target)
         loss = loss_combo #+ (1 - dice_score)
@@ -477,15 +575,14 @@ class CoolSystem(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         self.model.eval()
         neighbor, target, _ = batch
-        logits = self.model(neighbor)  # → could be [B, C, H, W] or [B, T, C, H, W]
+        logits = self.model(neighbor)  #  could be [B, C, H, W] or [B, T, C, H, W]
         #print(logits.shape) #?torch.Size([3, 3, 256, 256])
-        # 1) If there's a time dimension, flatten it into the batch:
 
         if logits.ndim == 5:
             B, T, C, H, W = logits.shape
-            # reshape logits → [B*T, C, H, W]
+            # reshape logits  [B*T, C, H, W]
             logits = logits.view(B * T, C, H, W)
-            # replicate target across time → [B*T, H, W]
+            # replicate target across time  [B*T, H, W]
             #target = target.unsqueeze(1).repeat(1, T, 1, 1).view(B * T, H, W)
         if target.ndim == 5:
             B, T, C, H, W = target.shape
@@ -495,14 +592,22 @@ class CoolSystem(pl.LightningModule):
         #print(target.shape) #[1, 3, 256, 256]
         target = target.view(B*T, H, W)
 
-        #print(target.shape) torch.Size([3, 256, 256])
-        #print(logits.shape) #torch.Size([3, 3, 256, 256])
+        #print(target.shape) #torch.Size([5, 256, 256])
+        #print(logits.shape) #torch.Size([5, 3, 256, 256])
 
-        loss = combo_loss(logits, target, num_classes=self.num_classes)
+        loss = recall_focused_loss(logits, target, num_classes=self.num_classes)
         self.val_losses.append(loss)
+
+        pred_classes = logits.detach().cpu().argmax(dim=1).numpy().flatten()
+        target_classes = target.detach().cpu().numpy().flatten()
+
+
+        self.all_preds.extend(pred_classes)
+        self.all_targets.extend(target_classes)
+
         preds = logits.argmax(dim=1)  # [B*T or B, H, W]
         '''
-        # log image examples (unchanged)
+        # If you want to log samples during validation:
         sample_pred = preds[0].cpu().numpy()
         sample_gt   = target[0].cpu().numpy()
         pred_rgb = wandb.Image(
@@ -527,38 +632,10 @@ class CoolSystem(pl.LightningModule):
         )
         '''
         
-        
-        # accumulate for epoch‐end
-        '''
-        self.preds.append(preds.cpu())
-        self.gts.append(target.cpu())
-
-        self.log('val_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
-
-        self.val_losses.append(loss.detach)
-
-        self.log("val/jaccard", self.val_jaccard(logits.softmax(dim=1), target), prog_bar=True)
-
-        return loss
-        '''
         self.val_jaccard.update(preds, target)
         self.val_dice.update(preds, target)
         self.multiclass_metrics.update(logits, target)
-        '''
-        #Visualiza a sample for wandb
-        if batch_idx == 0:
-            sample_pred = preds[0].cpu().numpy()
-            sample_gt = target[0].cpu().numpy()
-            pred_rgb = wandb.Image(sample_pred, masks={
-                'prediction': {'mask_data': sample_pred,
-                               'class_labels': {i: f'class_{i}' for i in range(self.num_classes)}}
-            })
-            gt_rgb = wandb.Image(sample_gt, masks={
-                'ground_truth': {'mask_data': sample_gt,
-                               'class_labels': {i: f'class_{i}' for i in range(self.num_classes)}}
-            })
-            self.logger.log_image(key='val_examples', images=[pred_rgb, gt_rgb])
-        '''
+
         
         return loss
 
@@ -580,20 +657,20 @@ class CoolSystem(pl.LightningModule):
         self.log("Fmeasure", results['f_measure']['mean'])
         self.log("Specificity", results['specificity']['mean'])
        
-        # Log per-class metrics
+       
         class_names = ["background", "solid", "non_solid"]
         for i in range(self.num_classes):
-            # Only log if this class appeared during validation
+            
             if results['class_counts'][i] > 0:
                 self.log(f"Dice_class_{class_names[i]}", results['dice']['per_class'][i])
                 self.log(f"Jaccard_class_{class_names[i]}", results['jaccard']['per_class'][i])
                 self.log(f"Precision_class_{class_names[i]}", results['precision']['per_class'][i])
                 self.log(f"Recall_class_{class_names[i]}", results['recall']['per_class'][i])
        
-        # Report class counts
+        
         print(f"Class counts during validation: {results['class_counts']}")
        
-        # Print summary
+        
         print(f"Val: Dice {results['dice']['mean']:.4f}, "
               f"Jaccard {results['jaccard']['mean']:.4f}, "
               f"Precision {results['precision']['mean']:.4f}, "
@@ -601,119 +678,58 @@ class CoolSystem(pl.LightningModule):
               f"Fmeasure {results['f_measure']['mean']:.4f}, "
               f"Specificity {results['specificity']['mean']:.4f}")
        
-        # Per-class metrics display
+        
         for i, name in enumerate(class_names):
             if results['class_counts'][i] > 0:
                 print(f"  Class {name}: Dice {results['dice']['per_class'][i]:.4f}, "
                       f"Jaccard {results['jaccard']['per_class'][i]:.4f}")
+        
+        conf_matrix = confusion_matrix(self.all_targets, self.all_preds, labels=range(self.num_classes))
+
+        
+        fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+        class_names = ["background", "solid", "non-solid"]
+
+        
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[0])
+        axes[0].set_ylabel('True Label')
+        axes[0].set_xlabel('Predicted Label')
+        axes[0].set_title(f'Raw Confusion Matrix')
+
+        row_sums = conf_matrix.sum(axis=1)
+        row_norm_conf = conf_matrix / row_sums[:, np.newaxis]
+        sns.heatmap(row_norm_conf, annot=True, fmt='.2f', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[1])
+        axes[1].set_ylabel('True Label')
+        axes[1].set_xlabel('Predicted Label')
+        axes[1].set_title(f'Row-Normalized Confusion Matrix (Recall)')
+
+        col_sums = conf_matrix.sum(axis=0)
+        col_norm_conf = conf_matrix / col_sums[np.newaxis, :]
+        sns.heatmap(col_norm_conf, annot=True, fmt='.2f', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[2])
+        axes[2].set_ylabel('True Label')
+        axes[2].set_xlabel('Predicted Label')
+        axes[2].set_title(f'Column-Normalized Confusion Matrix (Precision)')
+
+        plt.tight_layout()
+
+        wandb.log({
+            'val/confusion_matrix_raw': wandb.Image(axes[0].figure),
+            'val/confusion_matrix_row_norm': wandb.Image(axes[1].figure),
+            'val/confusion_matrix_col_norm': wandb.Image(axes[2].figure),
+        })
        
-        # Reset all metrics for next epoch
         self.val_losses.clear()
         self.val_jaccard.reset()
         self.val_dice.reset()
         self.multiclass_metrics.reset()
         self.preds.clear()
         self.gts.clear()
-        '''
-        #Shape [total_samples, H, W]
-        all_preds = torch.cat(self.preds, dim=0).numpy()
-        all_gts   = torch.cat(self.gts,   dim=0).numpy()
-        C = self.num_classes
-
-        #For each class, we'll collect one S, one E, one MAE, etc.
-        sm_class = [Smeasure() for _ in range(C)]
-        em_class = [Emeasure() for _ in range(C)]
-        mae_class= [MAE()      for _ in range(C)]
-
-        thresholds = np.linspace(0, 1, 1) #256, for now i dont use threshold related metrics, so this is usless
-        dice_per_class      = [[] for _ in range(C)]
-        specificity_per_class = [[] for _ in range(C)]
-        precision_per_class   = [[] for _ in range(C)]
-        recall_per_class      = [[] for _ in range(C)]
-        fmeasure_per_class    = [[] for _ in range(C)]
-        jaccard_per_class     = [[] for _ in range(C)]
-
-        #Iterate over each sample
-        for pred_mask, gt_mask in zip(all_preds, all_gts):
-            # For each class c, build a binary mask
-            for c in range(C):
-                pred_c = (pred_mask == c).astype(np.uint8)
-                gt_c   = (gt_mask   == c).astype(np.uint8)
-                
-                
-                # Update structural metrics
-                sm_class[c].step(pred_c, gt_c)
-                em_class[c].step(pred_c, gt_c)
-                mae_class[c].step(pred_c, gt_c)
-
-                # Threshold‐sweep metrics
-                d_lst, s_lst, p_lst, r_lst, f_lst, j_lst = [], [], [], [], [], []
-                for t in thresholds:
-                    bin_pred = (pred_mask == c).astype(np.uint8)  # same as pred_c, but you could simulate uncertainty
-                    # If you had soft‐preds, you'd threshold them here
-                    dice, spec, prec, rec, fmeas, jacc = \
-                        self.evaluate_one_img(bin_pred, gt_c)
-                    d_lst.append(dice)
-                    s_lst.append(spec)
-                    p_lst.append(prec)
-                    r_lst.append(rec)
-                    f_lst.append(fmeas)
-                    j_lst.append(jacc)
-
-                # average over thresholds
-                dice_per_class[c].append(np.mean(d_lst))
-                specificity_per_class[c].append(np.mean(s_lst))
-                precision_per_class[c].append(np.mean(p_lst))
-                recall_per_class[c].append(np.mean(r_lst))
-                fmeasure_per_class[c].append(np.mean(f_lst))
-                jaccard_per_class[c].append(np.mean(j_lst))
-
-        #Compute per‐class and macro‐averages
-        logs = {}
-        for c in range(C):
-            if len(dice_per_class[c]) > 0:
-                logs[f"class_{c}/Smeasure"]     = sm_class[c].get_results()["Smeasure"]
-                logs[f"class_{c}/Emeasure"]     = em_class[c].get_results()["meanEm"]
-                logs[f"class_{c}/MAE"]          = mae_class[c].get_results()["MAE"]
-                logs[f"class_{c}/Dice"]         = np.mean(dice_per_class[c])
-                logs[f"class_{c}/Jaccard"]      = np.mean(jaccard_per_class[c])
-                logs[f"class_{c}/Precision"]    = np.mean(precision_per_class[c])
-                logs[f"class_{c}/Recall"]       = np.mean(recall_per_class[c])
-                logs[f"class_{c}/Fmeasure"]     = np.mean(fmeasure_per_class[c])
-                logs[f"class_{c}/Specificity"]  = np.mean(specificity_per_class[c])
-            else:
-                logs[f"class_{c}/Smeasure"]     = float('nan')
-                logs[f"class_{c}/Emeasure"]     = float('nan')
-                logs[f"class_{c}/MAE"]          = float('nan')
-                logs[f"class_{c}/Dice"]         = float('nan')
-                logs[f"class_{c}/Jaccard"]      = float('nan')
-                logs[f"class_{c}/Precision"]    = float('nan')
-                logs[f"class_{c}/Recall"]       = float('nan')
-                logs[f"class_{c}/Fmeasure"]     = float('nan')
-                logs[f"class_{c}/Specificity"]  = float('nan')
-
-        # Macro‐average across classes
-                
-        for metric_name in ['Smeasure', 'Emeasure', 'MAE', 'Dice', 'Jaccard', 'Precision', 'Recall', 'Fmeasure', 'Specificity']:
-            valid_values = []
-            for c in range(C):
-                if f'class_{c}/{metric_name}' in logs and not np.isnan(logs[f'class_{c}/{metric_name}']):
-                    valid_values.append(logs[f'class_{c}/{metric_name}'])
-            
-            if valid_values:
-                logs[f'macro/{metric_name}'] = np.mean(valid_values)
-            else:
-                logs[f'macro/{metric_name}'] = float('nan')
-
-        #Log everything
-        for k, v in logs.items():
-            self.log(k, v, prog_bar=(k.startswith("macro/")), sync_dist=True)
-
-        #cleanup
-        self.preds.clear()
-        self.gts.clear()
-        self.val_losses.clear()
-        '''
+        self.all_targets.clear()
+        self.all_preds.clear()
+        
 
     def on_train_epoch_end(self):
         '''Log learning rate after each epoch'''
@@ -729,7 +745,7 @@ class CoolSystem(pl.LightningModule):
         val_loader = get_loader(self.params, mode='validation', num_fold=self.fold_number)
         return val_loader 
 
-    def _compute_loss(self, neigbor, target, rest):
+    def _compute_loss(self, neigbor, target, rest):   #Not used, at the moment we average over each clip frames (currently the best performing heuristc)
         # factor out training/validation loss computation
         # existing model forward + criterion
         if not self.with_edge:
@@ -758,7 +774,8 @@ def main():
         logger = WandbLogger(save_dir='.',
                         name=f'final multiclass segmentation fold {fold}',
                         project='Vivim_multiclass_segmentation',
-                        log_model=True)
+                        #log_model=True
+                        )
         pl.seed_everything(args.seed, workers=True)
         
         print('Start training for fold number ', fold)

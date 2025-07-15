@@ -1,5 +1,4 @@
-'''Script for the final multiclass training of Vivim on the FULL train set (so after cross validation)'''
-
+'''Script for training Vivim multiclass on a k-fold Cross Validation'''
 from typing import Optional
 import os
 #os.environ['CUDA_VISIBLE_DEVICES'] = '3' Only in case if u have multiple GPUs and want to use a specific one
@@ -14,6 +13,8 @@ from tqdm import tqdm
 import cfg
 from torchmetrics.classification import MulticlassJaccardIndex
 from torchmetrics.segmentation import DiceScore
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
 from torchmetrics.segmentation import DiceScore
 
@@ -41,8 +42,8 @@ from complements.create_train_data_multiclass import *
 
 args = cfg.parse_args()
 
-output_dir = 'multiclass_checkpoints_final'
-version_name='multiclass_segmentation_final'
+output_dir = 'logs_multiclass_final_training'
+version_name='multiclass segmentation final training'
 
 
 import matplotlib.pyplot as plt
@@ -61,16 +62,13 @@ from Multiclass_Data import *
 
 
 class MulticlassMetricsTracker:
-    """
-    Track metrics for individual classes, handling cases where classes may not be present.
-    Only includes classes that are actually present in the calculation of means.
-    """
+
     def __init__(self, num_classes=3):
         self.num_classes = num_classes
         self.reset()
        
     def reset(self):
-    
+       
         self.dice_per_class = [[] for _ in range(self.num_classes)]
         self.jaccard_per_class = [[] for _ in range(self.num_classes)]
         self.precision_per_class = [[] for _ in range(self.num_classes)]
@@ -78,6 +76,7 @@ class MulticlassMetricsTracker:
         self.f_measure_per_class = [[] for _ in range(self.num_classes)]
         self.specificity_per_class = [[] for _ in range(self.num_classes)]
        
+        
         self.class_counts = [0 for _ in range(self.num_classes)]
        
     def update(self, pred, gt):
@@ -87,25 +86,28 @@ class MulticlassMetricsTracker:
         if torch.is_tensor(gt):
             gt = gt.detach().cpu().numpy()
        
+        
         if pred.ndim == 4:  # [B, C, H, W]
             B, C, H, W = pred.shape
             pred = pred.reshape(-1, C, H, W)
             gt = gt.reshape(-1, H, W)
            
+        
         for sample_idx in range(len(pred)):
             sample_pred = pred[sample_idx]  # [C, H, W]
             sample_gt = gt[sample_idx]      # [H, W]
            
+            
             for class_idx in range(self.num_classes):
-                # Check if this class is present in the ground truth
+                
                 if np.any(sample_gt == class_idx):
                     self.class_counts[class_idx] += 1
                    
-                    # Create binary masks for this class
+                    
                     pred_binary = (sample_pred.argmax(axis=0) == class_idx).astype(np.int32)
                     gt_binary = (sample_gt == class_idx).astype(np.int32)
                    
-                    # Calculate metrics for this class
+                    
                     dice = misc2.dice(pred_binary, gt_binary)
                     jaccard = misc2.jaccard(pred_binary, gt_binary)
                     precision = misc2.precision(pred_binary, gt_binary)
@@ -113,7 +115,7 @@ class MulticlassMetricsTracker:
                     f_measure = misc2.fscore(pred_binary, gt_binary)
                     specificity = misc2.specificity(pred_binary, gt_binary)
                    
-                    # Store metrics
+                    
                     self.dice_per_class[class_idx].append(dice)
                     self.jaccard_per_class[class_idx].append(jaccard)
                     self.precision_per_class[class_idx].append(precision)
@@ -122,7 +124,6 @@ class MulticlassMetricsTracker:
                     self.specificity_per_class[class_idx].append(specificity)
    
     def get_results(self):
-        """Get average metrics across all classes"""
         
         dice_values = [np.mean(self.dice_per_class[i]) if self.class_counts[i] > 0 else None
                      for i in range(self.num_classes)]
@@ -142,11 +143,12 @@ class MulticlassMetricsTracker:
         specificity_values = [np.mean(self.specificity_per_class[i]) if self.class_counts[i] > 0 else None
                             for i in range(self.num_classes)]
        
-        # Calculate overall averages
+        
         def safe_mean(values):
             valid_values = [v for v in values if v is not None]
             return np.mean(valid_values) if valid_values else 0.0
        
+        
         results = {
             'dice': {
                 'per_class': dice_values,
@@ -191,22 +193,27 @@ def dice_loss(logits, targets, num_classes, smooth=1e-6):
     """
     N, C, H, W = logits.shape
     
+    # Convert predictions to probabilities
     probs = F.softmax(logits, dim=1)
     
+    # One-hot encode targets
     targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
     
+    # Calculate Dice for each class
     dice_scores = []
     for c in range(C):
         pred_c = probs[:, c, ...]
         targ_c = targets_onehot[:, c, ...]
         
+        # Calculate intersection and union
         intersection = (pred_c * targ_c).sum(dim=(1, 2))
         union = pred_c.sum(dim=(1, 2)) + targ_c.sum(dim=(1, 2))
         
+        # Dice formula
         dice_c = (2. * intersection + smooth) / (union + smooth)
         dice_scores.append(1 - dice_c.mean())  # Convert to loss
     
-    return sum(dice_scores) / C  
+    return sum(dice_scores) / C  # Average across classes
 
 def tversky_loss(logits, targets, num_classes, alpha=0.3, beta=0.7, smooth=1e-6):
     """
@@ -224,15 +231,19 @@ def tversky_loss(logits, targets, num_classes, alpha=0.3, beta=0.7, smooth=1e-6)
     """
     N, C, H, W = logits.shape
     
+    # Convert predictions to probabilities
     probs = F.softmax(logits, dim=1)
     
+    # One-hot encode targets
     targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
     
+    # Calculate Tversky for each class
     tversky_scores = []
     for c in range(C):
         pred_c = probs[:, c, ...]
         targ_c = targets_onehot[:, c, ...]
         
+        # Calculate true positives, false positives, false negatives
         tp = (pred_c * targ_c).sum(dim=(1, 2))
         fp = (pred_c * (1 - targ_c)).sum(dim=(1, 2))
         fn = ((1 - pred_c) * targ_c).sum(dim=(1, 2))
@@ -241,7 +252,7 @@ def tversky_loss(logits, targets, num_classes, alpha=0.3, beta=0.7, smooth=1e-6)
         tversky_c = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
         tversky_scores.append(1 - tversky_c.mean())  # Convert to loss
     
-    return sum(tversky_scores) / C  
+    return sum(tversky_scores) / C  # Average across classes
 
 def boundary_aware_loss(logits, targets, num_classes, weight=0.5):
     """
@@ -259,21 +270,27 @@ def boundary_aware_loss(logits, targets, num_classes, weight=0.5):
     
     N, C, H, W = logits.shape
     
+    # Convert targets to one-hot
     targets_onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 3, 1, 2).float()
     
+    # Calculate boundary masks using simple gradient operation
     boundary_masks = []
     for c in range(C):
         targ_c = targets_onehot[:, c, ...]
         
+        # Calculate gradient in X and Y directions
         grad_x = torch.abs(targ_c[:, :, 1:] - targ_c[:, :, :-1])
         grad_y = torch.abs(targ_c[:, 1:, :] - targ_c[:, :-1, :])
         
+        # Pad gradients to match original size
         grad_x = F.pad(grad_x, (0, 1, 0, 0))
         grad_y = F.pad(grad_y, (0, 0, 0, 1))
         
+        # Combine to get boundary mask
         boundary = torch.clamp(grad_x + grad_y, 0, 1)
         boundary_masks.append(boundary)
     
+    # Stack boundary masks
     boundary_masks = torch.stack(boundary_masks, dim=1)
     
     # Calculate weighted BCE loss with boundary emphasis
@@ -293,6 +310,7 @@ def boundary_aware_loss(logits, targets, num_classes, weight=0.5):
     
     boundary_loss /= C
     
+    # Combined loss
     return interior_loss + weight * boundary_loss
 
 def combined_focal_dice_loss(logits, targets, num_classes, gamma=3.0, alpha=None, dice_weight=0.5):
@@ -309,12 +327,13 @@ def combined_focal_dice_loss(logits, targets, num_classes, gamma=3.0, alpha=None
         
     Returns: scalar loss
     """
-   
+    # Calculate focal loss with explicit alpha (if provided)
     focal = class_balanced_focal_loss(logits, targets, num_classes, gamma=gamma, alpha=alpha)
     
+    # Calculate dice loss
     dice = dice_loss(logits, targets, num_classes)
     
-    # Combined weighted loss 
+    # Combined weighted loss (adjust weights as needed)
     return (1.0 - dice_weight) * focal + dice_weight * dice
 
 def recall_focused_loss(logits, targets, num_classes, gamma=2.0):
@@ -338,7 +357,7 @@ def recall_focused_loss(logits, targets, num_classes, gamma=2.0):
     # Calculate focal loss with explicit alpha
     focal = class_balanced_focal_loss(logits, targets, num_classes, gamma=gamma, alpha=alpha)
     
-    # Weighted combination prioritizing tversky loss for better recall (currently the best performing option)
+    # Weighted combination prioritizing tversky loss for better recall
     return 0.4 * focal + 0.6 * tversky
 
 def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=None):
@@ -362,6 +381,7 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
     
     # If no specific class weights are provided, calculate them based on inverse frequency
     if alpha is None:
+        # Count class frequencies
         class_counts = []
         for c in range(num_classes):
             class_counts.append((targets == c).sum().float() + 1e-6)  # Add small eps to avoid div by 0
@@ -372,6 +392,7 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
         total_pixels = N * H * W
         class_weights = total_pixels / (num_classes * torch.tensor(class_counts).to(logits.device))
         
+        # Normalize weights to sum to 1
         alpha = class_weights / class_weights.sum()
 
         #print("Automatically calculated alpha values:", [weight.item() for weight in alpha])
@@ -385,6 +406,7 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
     
     focal_losses = []
     for c in range(C):
+        # Extract class probability and target
         p_c = probs[:, c, ...]
         t_c = targets_onehot[:, c, ...]
         
@@ -394,78 +416,38 @@ def class_balanced_focal_loss(logits, targets, num_classes, gamma=2.0, alpha=Non
         # Binary cross entropy with focus weight
         bce = -t_c * torch.log(p_c + 1e-6) - (1 - t_c) * torch.log(1 - p_c + 1e-6)
         
+        # Apply focal weight and class balancing weight
         class_loss = (alpha[c] * focal_weight * bce).mean()
         focal_losses.append(class_loss)
     
     return sum(focal_losses)
 
 
-def multiclass_structure_loss(logits: torch.Tensor,
-                              targets: torch.Tensor,
-                              num_classes: int,
-                              eps: float = 1e-6) -> torch.Tensor:
-    """
-    logits:  [N, C, H, W]    raw scores for C classes
-    targets: [N, H, W]       integer labels in {0,1,…,C-1}
-    returns: scalar loss
-    """
-    N, C, H, W = logits.shape
-    #convert targets to one–hot: [N, C, H, W]
-    targets_onehot = F.one_hot(targets.long(), num_classes=C) \
-                      .permute(0, 3, 1, 2).float()
-
-    # per-class weighted‐structure loss
-    losses = []
-    for c in range(C):
-        pred_c = logits[:, c:c+1, ...]           # [N,1,H,W]
-        mask_c = targets_onehot[:, c:c+1, ...]   # [N,1,H,W]
-
-        # spatial weight map
-        weit = 1 + 5 * torch.abs(
-            F.avg_pool2d(mask_c, kernel_size=31, stride=1, padding=15)   #could try with 15, 7
-            - mask_c
-        )
-
-        # weighted BCE
-        wbce = F.binary_cross_entropy_with_logits(
-            pred_c, mask_c, reduction='none'
-        )
-        wbce = (weit * wbce).sum(dim=(2,3)) / weit.sum(dim=(2,3))
-
-        # weighted IoU
-        prob  = torch.sigmoid(pred_c)
-        inter = (prob * mask_c * weit).sum(dim=(2,3))
-        union = ((prob + mask_c) * weit).sum(dim=(2,3))
-        wiou  = 1 - (inter + eps) / (union - inter + eps)
-
-        # average over batch
-        losses.append((wbce + wiou).mean())
-
-    # average over classes
-    return sum(losses) / C
-
-
-def get_loader(args, mode):
-        input_root = '/shared/tesi-signani-data/dataset-segmentation/raw_dataset'
+def get_loader(args, mode, num_fold, epoch_num):
+        input_root = 'Multiclass_Folds/fold_' + str(num_fold)
 
         train_path = os.path.join(input_root, 'train')
-        train_output_root = 'Multiclass_TrainData_final'
+        train_output_root = 'Multiclass_TrainData_fold_' + str(num_fold)
         train_output_root = os.path.join(train_output_root, 'train')
         gather_multiclass_frames(Path(train_path), Path(train_output_root))
-        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity)
+        full_train_dataset = DynamicDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity, seed=args.seed, epoch=epoch_num)
 
+        val_path = os.path.join(input_root, 'val')
+        val_output_root = 'Multiclass_TrainData_fold_' + str(num_fold)
+        val_output_root = os.path.join(val_output_root, 'val')
+        gather_multiclass_frames(Path(val_path), Path(val_output_root))
+        full_val_dataset = MainDataset(root=val_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity)
 
         if mode == 'training': 
             train_loader = DataLoader(full_train_dataset,  batch_size=args.train_bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
             return train_loader
         elif mode=='validation':
-            val_loader = DataLoader(full_train_dataset, batch_size=args.val_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            val_loader = DataLoader(full_val_dataset, batch_size=args.val_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
             return val_loader
-
 
 class CoolSystem(pl.LightningModule):
     
-    def __init__(self, hparams):
+    def __init__(self, hparams, fold_number):
         super(CoolSystem, self).__init__()
 
         self.params = hparams
@@ -475,7 +457,9 @@ class CoolSystem(pl.LightningModule):
         self.train_batchsize = self.params.train_bs
         self.val_batchsize = self.params.val_bs
 
+        self.fold_number = fold_number 
         
+        #Train setting
         self.initlr = self.params.initlr #initial learning rate
         self.weight_decay = self.params.weight_decay #optimizers weight decay
         self.crop_size = self.params.crop_size #random crop size
@@ -483,12 +467,17 @@ class CoolSystem(pl.LightningModule):
         self.epochs = self.params.epochs
         self.shift_length = self.params.shift_length
         self.val_aug = self.params.val_aug
-        self.with_edge = self.params.with_edge #requires pretraining
+        self.with_edge = self.params.with_edge
+
+        self.epoch_number = 0
 
         self.num_classes = self.params.num_classes
 
         self.gts = []
         self.preds = []
+
+        self.all_targets = []
+        self.all_preds = []
         
         self.nFrames = self.params.clip_length
         self.upscale_factor = 1
@@ -519,10 +508,11 @@ class CoolSystem(pl.LightningModule):
         #added gradient clipping to help with convergence:
         for param_groups in optimizer.param_groups:
             param_groups['clip_grad_norm'] = 1.0
-        # Could try the following optimizer instead of AdamW
+
         # optimizer = Lion(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.initlr,betas=[0.9,0.99],weight_decay=0)
 
         #Added a scheduler to improve the model convergence  
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.initlr * 0.01)
 
         return [optimizer], [scheduler]
@@ -554,15 +544,14 @@ class CoolSystem(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.model.train()
         neighbor, target, _ = batch
-        logits = self.model(neighbor)  # could be [B, C, H, W] or [B, T, C, H, W]
+        logits = self.model(neighbor)  #  could be [B, C, H, W] or [B, T, C, H, W]
         #print(logits.shape) #?torch.Size([3, 3, 256, 256])
-        # If there's a time dimension, flatten it into the batch:
 
         if logits.ndim == 5:
             B, T, C, H, W = logits.shape
-            # reshape logits: [B*T, C, H, W]
+            # reshape logits [B*T, C, H, W]
             logits = logits.view(B * T, C, H, W)
-            # replicate target across time: [B*T, H, W]
+            # replicate target across time  [B*T, H, W]
             #target = target.unsqueeze(1).repeat(1, T, 1, 1).view(B * T, H, W)
         if target.ndim == 5:
             B, T, C, H, W = target.shape
@@ -587,7 +576,7 @@ class CoolSystem(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         self.model.eval()
         neighbor, target, _ = batch
-        logits = self.model(neighbor)  # could be [B, C, H, W] or [B, T, C, H, W]
+        logits = self.model(neighbor)  #  could be [B, C, H, W] or [B, T, C, H, W]
         #print(logits.shape) #?torch.Size([3, 3, 256, 256])
 
         if logits.ndim == 5:
@@ -604,15 +593,22 @@ class CoolSystem(pl.LightningModule):
         #print(target.shape) #[1, 3, 256, 256]
         target = target.view(B*T, H, W)
 
-        #print(target.shape) torch.Size([3, 256, 256])
-        #print(logits.shape) #torch.Size([3, 3, 256, 256])
+        #print(target.shape) #torch.Size([5, 256, 256])
+        #print(logits.shape) #torch.Size([5, 3, 256, 256])
 
         loss = recall_focused_loss(logits, target, num_classes=self.num_classes)
         self.val_losses.append(loss)
-        preds = logits.argmax(dim=1)  # [B*T or B, H, W]
 
+        pred_classes = logits.detach().cpu().argmax(dim=1).numpy().flatten()
+        target_classes = target.detach().cpu().numpy().flatten()
+
+
+        self.all_preds.extend(pred_classes)
+        self.all_targets.extend(target_classes)
+
+        preds = logits.argmax(dim=1)  # [B*T or B, H, W]
         '''
-        #If you want to log images during validation:
+        # If you want to log samples during validation:
         sample_pred = preds[0].cpu().numpy()
         sample_gt   = target[0].cpu().numpy()
         pred_rgb = wandb.Image(
@@ -640,20 +636,7 @@ class CoolSystem(pl.LightningModule):
         self.val_jaccard.update(preds, target)
         self.val_dice.update(preds, target)
         self.multiclass_metrics.update(logits, target)
-        
-        if batch_idx == 0:
-            sample_pred = preds[0].cpu().numpy()
-            sample_gt = target[0].cpu().numpy()
-            pred_rgb = wandb.Image(sample_pred, masks={
-                'prediction': {'mask_data': sample_pred,
-                               'class_labels': {i: f'class_{i}' for i in range(self.num_classes)}}
-            })
-            gt_rgb = wandb.Image(sample_gt, masks={
-                'ground_truth': {'mask_data': sample_gt,
-                               'class_labels': {i: f'class_{i}' for i in range(self.num_classes)}}
-            })
-            self.logger.log_image(key='val_examples', images=[pred_rgb, gt_rgb])
-        
+
         
         return loss
 
@@ -675,20 +658,20 @@ class CoolSystem(pl.LightningModule):
         self.log("Fmeasure", results['f_measure']['mean'])
         self.log("Specificity", results['specificity']['mean'])
        
-        # Log per-class metrics
+       
         class_names = ["background", "solid", "non_solid"]
         for i in range(self.num_classes):
-            # Only log if this class appeared during validation
+            
             if results['class_counts'][i] > 0:
                 self.log(f"Dice_class_{class_names[i]}", results['dice']['per_class'][i])
                 self.log(f"Jaccard_class_{class_names[i]}", results['jaccard']['per_class'][i])
                 self.log(f"Precision_class_{class_names[i]}", results['precision']['per_class'][i])
                 self.log(f"Recall_class_{class_names[i]}", results['recall']['per_class'][i])
        
-        # Report class counts
+        
         print(f"Class counts during validation: {results['class_counts']}")
        
-        # Print summary
+        
         print(f"Val: Dice {results['dice']['mean']:.4f}, "
               f"Jaccard {results['jaccard']['mean']:.4f}, "
               f"Precision {results['precision']['mean']:.4f}, "
@@ -696,38 +679,75 @@ class CoolSystem(pl.LightningModule):
               f"Fmeasure {results['f_measure']['mean']:.4f}, "
               f"Specificity {results['specificity']['mean']:.4f}")
        
-        # Per-class metrics display
+        
         for i, name in enumerate(class_names):
             if results['class_counts'][i] > 0:
                 print(f"  Class {name}: Dice {results['dice']['per_class'][i]:.4f}, "
                       f"Jaccard {results['jaccard']['per_class'][i]:.4f}")
+        
+        conf_matrix = confusion_matrix(self.all_targets, self.all_preds, labels=range(self.num_classes))
+
+        
+        fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+        class_names = ["background", "solid", "non-solid"]
+
+        
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[0])
+        axes[0].set_ylabel('True Label')
+        axes[0].set_xlabel('Predicted Label')
+        axes[0].set_title(f'Raw Confusion Matrix')
+
+        row_sums = conf_matrix.sum(axis=1)
+        row_norm_conf = conf_matrix / row_sums[:, np.newaxis]
+        sns.heatmap(row_norm_conf, annot=True, fmt='.2f', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[1])
+        axes[1].set_ylabel('True Label')
+        axes[1].set_xlabel('Predicted Label')
+        axes[1].set_title(f'Row-Normalized Confusion Matrix (Recall)')
+
+        col_sums = conf_matrix.sum(axis=0)
+        col_norm_conf = conf_matrix / col_sums[np.newaxis, :]
+        sns.heatmap(col_norm_conf, annot=True, fmt='.2f', cmap='Blues',
+                    xticklabels=class_names, yticklabels=class_names, ax=axes[2])
+        axes[2].set_ylabel('True Label')
+        axes[2].set_xlabel('Predicted Label')
+        axes[2].set_title(f'Column-Normalized Confusion Matrix (Precision)')
+
+        plt.tight_layout()
+
+        wandb.log({
+            'val/confusion_matrix_raw': wandb.Image(axes[0].figure),
+            'val/confusion_matrix_row_norm': wandb.Image(axes[1].figure),
+            'val/confusion_matrix_col_norm': wandb.Image(axes[2].figure),
+        })
        
-        # Reset all metrics for next epoch
         self.val_losses.clear()
         self.val_jaccard.reset()
         self.val_dice.reset()
         self.multiclass_metrics.reset()
         self.preds.clear()
         self.gts.clear()
-       
+        self.all_targets.clear()
+        self.all_preds.clear()
+        
 
     def on_train_epoch_end(self):
         '''Log learning rate after each epoch'''
         current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log('learning_rate', current_lr, on_step=False, on_epoch=True)
+        self.epoch_number += 1
 
 
     def train_dataloader(self):
-        train_loader = get_loader(self.params, mode='training')
+        train_loader = get_loader(self.params, mode='training', num_fold=self.fold_number, epoch_num=self.epoch_number)
         return train_loader
     
     def val_dataloader(self):
-        val_loader = get_loader(self.params, mode='validation')
+        val_loader = get_loader(self.params, mode='validation', num_fold=self.fold_number, epoch_num=self.epoch_number)
         return val_loader 
-    
 
-    '''The following function is not used in the current settings, as i am currently averaging the loss throughout the clip, without extracting a representative sample (this way the model performs better)'''
-    def _compute_loss(self, neigbor, target, rest):
+    def _compute_loss(self, neigbor, target, rest):   #Not used, at the moment we average over each clip frames (currently the best performing heuristc)
         # factor out training/validation loss computation
         # existing model forward + criterion
         if not self.with_edge:
@@ -746,43 +766,46 @@ class CoolSystem(pl.LightningModule):
 def main():
    
     
-    
+    for fold in range(args.num_folds):
         wandb.init(
         project='Vivim_multiclass_segmentation',
-        name=f'final multiclass training segmentation_with_tversky_loss',
+        name=f'final multiclass segmentation fold {fold}',
         config=vars(args)
        )
 
         logger = WandbLogger(save_dir='.',
-                        name=f'final multiclass training segmentation_with_tversky_loss',
-                        project='Vivim_multiclass_segmentation')
+                        name=f'final multiclass segmentation fold {fold}',
+                        project='Vivim_multiclass_segmentation',
+                        #log_model=True
+                        # 
+                        )
         pl.seed_everything(args.seed, workers=True)
         
+        print('Start training for fold number ', fold)
 
         #resume_checkpoint_path = 'Logs/ultra-epoch14-fold-0.ckpt'
         resume_checkpoint_path = args.resume_path
 
-        model = CoolSystem(args)
+        model = CoolSystem(args, fold_number=fold)
 
         checkpoint_callback = ModelCheckpoint(
-        monitor='train/loss',
-        dirpath='multiclass_checkpoints_final',
-        filename='model-epoch{epoch:02d}',
+        monitor='val/dice',
+        dirpath=output_dir,
+        filename='ultra-epoch{epoch:02d}-macroDice-{macro/Dice:.4f}-fold{fold}',
         auto_insert_metric_name=False,   
         every_n_epochs=1,
-        save_top_k=3,
-        mode = "min",
+        save_top_k=1,
+        mode = "max",
         save_last=True
         )
 
         lr_monitor_callback = LearningRateMonitor(logging_interval='step')
         trainer = pl.Trainer(
-            check_val_every_n_epoch=args.epochs - 1,  #Just for confort, so i dont have to change the checkpoint logging, (here validation test = training test)
-            num_sanity_val_steps=0,  #no need (we dont have a validation)
+            check_val_every_n_epoch=args.val_freq,
             max_epochs=args.epochs,
             accelerator='gpu',
             devices=1,
-            precision=16, #Could use 32, but 16-mixed precision is faster
+            precision=16,
             logger=logger,
             strategy="auto",
             enable_progress_bar=True,

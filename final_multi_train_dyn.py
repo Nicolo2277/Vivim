@@ -1,4 +1,4 @@
-'''Script for the final multiclass training of Vivim on the FULL train set (so after cross validation)'''
+'''Script for the final multiclass training of Vivim on the FULL train set (so after cross validation) with dynamically updated sequences'''
 
 from typing import Optional
 import os
@@ -445,14 +445,14 @@ def multiclass_structure_loss(logits: torch.Tensor,
     return sum(losses) / C
 
 
-def get_loader(args, mode):
+def get_loader(args, mode, epoch_number):
         input_root = '/shared/tesi-signani-data/dataset-segmentation/raw_dataset'
 
         train_path = os.path.join(input_root, 'train')
         train_output_root = 'Multiclass_TrainData_final'
         train_output_root = os.path.join(train_output_root, 'train')
         gather_multiclass_frames(Path(train_path), Path(train_output_root))
-        full_train_dataset = MainDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity)
+        full_train_dataset = DynamicDataset(root=train_output_root, trainsize=args.image_size, clip_len=args.clip_length, max_num=args.max_numerosity, seed=args.seed, epoch=epoch_number)
 
 
         if mode == 'training': 
@@ -486,6 +486,8 @@ class CoolSystem(pl.LightningModule):
         self.with_edge = self.params.with_edge #requires pretraining
 
         self.num_classes = self.params.num_classes
+
+        self.epoch_number = 0
 
         self.gts = []
         self.preds = []
@@ -715,6 +717,7 @@ class CoolSystem(pl.LightningModule):
         '''Log learning rate after each epoch'''
         current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log('learning_rate', current_lr, on_step=False, on_epoch=True)
+        self.epoch_number += 1
 
 
     def train_dataloader(self):
@@ -766,7 +769,7 @@ def main():
 
         checkpoint_callback = ModelCheckpoint(
         monitor='train/loss',
-        dirpath='multiclass_checkpoints_final',
+        dirpath='multiclass_checkpoints_final_dynamic',
         filename='model-epoch{epoch:02d}',
         auto_insert_metric_name=False,   
         every_n_epochs=1,

@@ -3,11 +3,7 @@ import shutil
 from pathlib import Path
 
 def find_annotated_dirs(input_root: Path):
-    """
-    Walk input_root and yield any directory that contains at least:
-      - frame.png
-      - background.png
-    """
+
     for dirpath, _, filenames in os.walk(input_root):
         files = set(f.lower() for f in filenames)
         if 'frame.png' in files and 'background.png' in files:
@@ -22,7 +18,6 @@ def gather_multiclass_frames(input_root: Path, output_root: Path):
     output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Group annotated dirs by top-level video
     videos = {}
     for ann_dir in find_annotated_dirs(input_root):
         try:
@@ -32,17 +27,14 @@ def gather_multiclass_frames(input_root: Path, output_root: Path):
             continue
         videos.setdefault(video_name, []).append(ann_dir)
 
-    # Copy out
     for vid, dirs in videos.items():
         dest_vid = output_root / vid
         dest_vid.mkdir(parents=True, exist_ok=True)
 
-        # sort for deterministic order
         dirs = sorted(dirs, key=lambda p: str(p))
         for idx, ann in enumerate(dirs):
             prefix = f"{idx:04d}_"
 
-            # always copy frame + background
             for fname in ('frame.png', 'background.png'):
                 src = ann / fname
                 dst = dest_vid / f"{prefix}{fname}"

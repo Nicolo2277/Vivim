@@ -1,3 +1,7 @@
+'''
+Script to create the k fold cross validation (it takes into account both the histoligical distribution and per-item frame count when splitting the dataset)
+Will return a Multiclass_Folds folder containing the already ready for training split (so for ex. i will have a folder fold_0 which inside has already train and validation splitted with the crossvalidation logic used(ex. 80/20 for a 5-folds cross validation))
+'''
 import os
 import shutil
 from pathlib import Path
@@ -20,7 +24,7 @@ def gather_annotated_frames(input_root: Path) -> pd.DataFrame:
     records = []
     for dirpath, _, filenames in os.walk(input_root):
         files = {f.lower() for f in filenames}
-        # must have the frame and at least one mask
+        
         if 'frame.png' in files and any(m in files for m in ('background.png','solid.png','non-solid.png')):
             dirp = Path(dirpath)
             rel = dirp.relative_to(input_root)
@@ -55,7 +59,6 @@ def create_visualizations(df, output_dir, hist_df=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Set the style for all plots
     sns.set_style("whitegrid")
     plt.rcParams.update({'font.size': 14})
     
@@ -213,12 +216,11 @@ def evaluate_fold_balance(folds, df):
     """
     Evaluate the balance of solid/non-solid masks across folds.
     Returns a DataFrame with metrics for each fold.
-    Includes robust error handling for edge cases.
     """
     results = []
     
     try:
-        # Check if required columns exist
+        
         required_cols = ['has_solid', 'has_nonsolid']
         for col in required_cols:
             if col not in df.columns:
@@ -337,11 +339,10 @@ def make_stratified_group_folds(
     n_bins: int = 4,
     max_attempts: int = 10
 ):
-    # Load and prepare data
+
     df = gather_annotated_frames(input_root)
     output_root.mkdir(parents=True, exist_ok=True)
     
-    # Create overall dataset visualizations
     try:
         hist_df = pd.read_csv(csv_root)
         vis_dir = create_visualizations(df, output_root / 'dataset_analysis', hist_df)
@@ -360,7 +361,6 @@ def make_stratified_group_folds(
     else:
         case_df['histological'] = 'unknown'
     
-    # Count frames per case and bin them
     frame_counts = df.groupby('clinical_case').size().rename('frame_count')
     case_df = case_df.join(frame_counts, on='clinical_case')
     
@@ -513,7 +513,7 @@ def make_stratified_group_folds(
     plt.savefig(output_root / 'fold_balance_analysis.png')
     plt.close()
     
-    # Create table of fold statistics
+    
     fold_stats = balance_df.copy()
     fold_stats['train_solid_pct'] = fold_stats['train_solid_ratio'] * 100
     fold_stats['train_nonsolid_pct'] = fold_stats['train_nonsolid_ratio'] * 100
@@ -600,10 +600,10 @@ def make_stratified_group_folds(
                 dest = tgt / row['clinical_case'] / Path(row['item'])
                 dest.mkdir(parents=True, exist_ok=True)
                 
-                # copy the frame
+                
                 shutil.copy2(row['frame_path'], dest / 'frame.png')
                 
-                # copy each mask if present
+                
                 if row['background_path'] is not None:
                     shutil.copy2(row['background_path'], dest / 'background.png')
                 if row['solid_path'] is not None:
@@ -615,12 +615,11 @@ def make_stratified_group_folds(
                 if 'fan_path' in row and pd.notnull(row['fan_path']):
                     shutil.copy2(row['fan_path'], dest / 'fan.png')
     
-    # Generate summary report
+    # summary report
     print(f"\nData split complete. Files copied to {output_root}")
     print(f"Dataset analysis visualizations saved to {output_root / 'dataset_analysis'}")
     print(f"Fold balance visualizations saved to {output_root}")
     
-    # Save metadata about the splits for future reference
     metadata = {
         'total_frames': len(df),
         'total_cases': len(case_df),
@@ -643,13 +642,12 @@ def make_stratified_group_folds(
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_root',  type=Path, default=Path('/shared/tesi-signani-data/dataset-segmentation/raw_dataset/train'))
+    parser.add_argument('--input_root',  type=Path, default=Path('/shared/tesi-signani-data/dataset-segmentation/raw_dataset/train'), help='train folder location')
     parser.add_argument('--output_root', type=Path, default=Path('Multiclass_Folds'))
     parser.add_argument('--csv_root',    type=Path, default=Path('clinical-cases-metadata-holsbeke.csv'))
     parser.add_argument('--splits',      type=int,  default=5)
     parser.add_argument('--seed',        type=int,  default=42)
-    parser.add_argument('--attempts',    type=int,  default=10,
-                        help='Number of random seeds to try for optimal balance')
+    parser.add_argument('--attempts',    type=int,  default=10, help='Number of random seeds to try for optimal balance')
     args = parser.parse_args()
     
     make_stratified_group_folds(
@@ -658,6 +656,6 @@ if __name__ == '__main__':
         csv_root=args.csv_root,
         n_splits=args.splits,
         random_state=args.seed,
-        n_bins=4,
+        n_bins=4, #4 works fine, could try 3 as well
         max_attempts=args.attempts
     )

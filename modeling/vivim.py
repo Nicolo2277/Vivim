@@ -53,7 +53,7 @@ class LayerNorm(nn.Module):
 
             return x
 
-
+#Added a DW convolution to the model to help convergency and prevent overfitting
 class DWConv(nn.Module):
     def __init__(self, dim=768):
         super(DWConv, self).__init__()
@@ -121,7 +121,7 @@ class MambaLayer(nn.Module):
                 bimamba_type="v3",
                 # use_fast_path=False,
         )
-
+        #Added dropout path throughout the model to help overfitting (made a huge difference and boost in loss convergency and overall performances)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -201,18 +201,15 @@ class mamba_block(nn.Module):
         hs = x
         for idx, x in enumerate(zip(self.downsample_layers.patch_embeddings, self.downsample_layers.block, self.downsample_layers.layer_norm, self.stages)):
             embedding_layer, block_layer, norm_layer, mam_stage = x
-            # first, obtain patch embeddings
             # print(hs.shape)
             hs, height, width = embedding_layer(hs)
 
-            # second, send embeddings through blocks
             for i, blk in enumerate(block_layer):
                 layer_outputs = blk(hs, height, width, False)
                 hs = layer_outputs[0]
 
-            # third, apply layer norm
+            # apply layer norm(could skip this part, no improvement noticed)
             # hs = norm_layer(hs)
-            # fourth, optionally reshape back to (batch_size, num_channels, height, width)
             hs = hs.reshape(bz*nf, height, width, -1).permute(0, 3, 1, 2).contiguous()
             # print(hs.shape)
             hs = hs.reshape(bz,nf,hs.shape[-3],hs.shape[-2],hs.shape[-1]).transpose(1,2)
@@ -238,7 +235,7 @@ class Vivim(nn.Module):
     def __init__(
         self,
         in_chans=3,
-        out_chans=3,  #Change here for multiclass segmentation
+        out_chans=3,  #Change here for multiclass segmentation! (original was =1 as vivim is thought for binary segmentation)
         depths=[2, 2, 2, 2],
         feat_size=[64, 128, 320, 512],
         drop_path_rate=0.2,

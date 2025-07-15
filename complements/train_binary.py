@@ -1,3 +1,4 @@
+'''Script for binary pretraining of vivim'''
 from typing import Optional
 import os
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0,1' #Only in case if u have multiple GPUs and want to use a specific one
@@ -23,14 +24,14 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import WandbLogger
 from argparse import Namespace
 
-from OTU_dataset import *
+from complements.OTU_dataset import *
 from torch.utils.data import DataLoader, Subset
 from loss import *
 # from models2.refinenet import RefineNet
 from torchvision.utils import save_image
 import wandb
 import misc2
-from create_train_set import *
+from complements.create_train_set import *
 
 args = cfg.parse_args()
 
@@ -50,9 +51,7 @@ from modeling.vivim import Vivim
 from poloy_metrics import *
 from modeling.utils import JointEdgeSegLoss
 # torch.set_float32_matmul_precision('high')
-from main_dataset import *
-
-from val_loss_test import add_diagnostics_to_trainer
+from complements.main_dataset import *
 
 
 def structure_loss(pred, mask):
